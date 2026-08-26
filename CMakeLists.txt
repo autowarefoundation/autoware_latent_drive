@@ -1,53 +1,98 @@
 cmake_minimum_required(VERSION 3.22)
-project(latentdrive_trt LANGUAGES CXX)
+project(latentdrive-trt LANGUAGES CXX)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-add_compile_options(-Wall -Wextra)
 
-find_package(CUDAToolkit REQUIRED)
+# ==============================================================================
+# Paths
+# ==============================================================================
+set(SRC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src")
+set(INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(CUDA_DIR "/usr/local/cuda")
+
+# ==============================================================================
+# Collect source files
+# ==============================================================================
+# Everything except main/ goes into the static library the future ROS 2 node
+# links against; main.cpp only carries the gflags mode dispatch
+file(GLOB_RECURSE LIB_SRC "${SRC_PATH}/cpp/common/*.cpp"
+     "${SRC_PATH}/cpp/latentdrive/*.cpp" "${SRC_PATH}/cpp/visualizer/*.cpp")
+file(GLOB_RECURSE MAIN_SRC "${SRC_PATH}/cpp/main/*.cpp")
+
+# ==============================================================================
+# Include directories
+# ==============================================================================
+# Headers are included flat (#include "logger.hpp"), so every subdirectory of
+# include/ joins the search path
+include_directories(${INC_PATH} ${CUDA_DIR}/include)
+
+file(
+  GLOB_RECURSE HEADER_DIRS
+  LIST_DIRECTORIES true
+  "${INC_PATH}/*")
+
+foreach(HEADER_DIR ${HEADER_DIRS})
+  if(IS_DIRECTORY ${HEADER_DIR})
+    include_directories(${HEADER_DIR})
+  endif()
+endforeach()
+
+# ==============================================================================
+# Link libraries
+# ==============================================================================
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio)
+include_directories(${OpenCV_INCLUDE_DIRS})
 
-# TensorRT ships no CMake config; locate header + libs directly.
-# TENSORRT_ROOT can point at a tarball install; the deployment container has
-# them in the default system paths.
-find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-  HINTS ${TENSORRT_ROOT} PATH_SUFFIXES include)
-find_library(TENSORRT_LIB_NVINFER nvinfer
-  HINTS ${TENSORRT_ROOT} PATH_SUFFIXES lib lib64)
-if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_LIB_NVINFER)
+# TensorRT ships no CMake config; locate the library directly. TENSORRT_ROOT
+# can point at a tarball install; the deployment container has it in the
+# default system paths
+find_library(
+  NVINFER_LIB nvinfer
+  HINTS ${TENSORRT_ROOT}
+  PATH_SUFFIXES lib lib64)
+if(NOT NVINFER_LIB)
   message(FATAL_ERROR "TensorRT not found (set -DTENSORRT_ROOT=/path/to/TensorRT)")
 endif()
-message(STATUS "TensorRT: ${TENSORRT_LIB_NVINFER}")
 
-# --- library: the inference interface a ROS 2 node links against ---
-add_library(latentdrive STATIC
-  src/planner.cpp
-  src/frame_window.cpp
-  src/bev_visualizer.cpp
-  src/camera_projector.cpp
-)
-target_include_directories(latentdrive
-  PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-          $<INSTALL_INTERFACE:include>
-  PRIVATE ${TENSORRT_INCLUDE_DIR}
-)
-target_link_libraries(latentdrive
-  PRIVATE ${TENSORRT_LIB_NVINFER} CUDA::cudart
-  PUBLIC  opencv_core opencv_imgproc
-)
+find_library(CUDART_LIB cudart HINTS ${CUDA_DIR}/lib64)
 
-# --- apps ---
-add_executable(run_package src/apps/run_package.cpp)
-target_include_directories(run_package PRIVATE src)
-target_link_libraries(run_package PRIVATE latentdrive opencv_imgcodecs)
+set(LIBS
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    gflags
+    pthread
+    ${OpenCV_LIBS})
 
-add_executable(visualize_sequence src/apps/visualize_sequence.cpp)
-target_include_directories(visualize_sequence PRIVATE src)
-target_link_libraries(visualize_sequence PRIVATE latentdrive opencv_imgcodecs opencv_videoio)
+# ==============================================================================
+# Compiler options
+# ==============================================================================
+set(CXX_FLAGS "-std=c++17 -pthread -fPIC")
 
-install(TARGETS latentdrive run_package visualize_sequence)
-install(DIRECTORY include/ DESTINATION include)
+# flags for debug
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(CXX_FLAGS "${CXX_FLAGS} -g -O0")
+else()
+  set(CXX_FLAGS "${CXX_FLAGS} -O3")
+endif()
+
+set(CXX_FLAGS "${CXX_FLAGS} -Wall -Wextra")
+
+foreach(CXX_FILE ${LIB_SRC} ${MAIN_SRC})
+  set_source_files_properties(${CXX_FILE} PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
+endforeach()
+
+# ==============================================================================
+# Set library, executable and output path
+# ==============================================================================
+add_library(latentdrive STATIC ${LIB_SRC})
+target_link_libraries(latentdrive PUBLIC ${LIBS})
+
+add_executable(${PROJECT_NAME} ${MAIN_SRC})
+target_link_libraries(${PROJECT_NAME} PRIVATE latentdrive)
+
+set_target_properties(
+  ${PROJECT_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+                             OUTPUT_NAME ${PROJECT_NAME})

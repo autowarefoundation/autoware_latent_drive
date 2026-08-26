@@ -2,8 +2,8 @@
 
 Standalone TensorRT C++ inference framework for the LatentDrive e2e planner
 (`e2e-idx8-hist4`: V-JEPA2 ViT-L encoder + planner transformer). This is the
-layer a ROS 2 node will sit on: the library knows nothing about ROS, files, or
-JSON — it takes camera frames and ego status, and returns a trajectory.
+layer the ROS 2 node will sit on: the library knows nothing about ROS, files
+or JSON — it takes camera frames and ego status, and returns a trajectory.
 
 ## Model contract
 
@@ -16,83 +16,87 @@ JSON — it takes camera frames and ego status, and returns a trajectory.
 The engine is produced by `deployment/` in the training repo
 (`kalfazed/JEPA-World-model`): ONNX opset 17 → `trtexec --fp16` with the
 planner stage pinned to fp32 (`build_engine.sh`). Validated 11/11 against the
-PyTorch reference; ~5 ms engine call / ~7 ms end-to-end per step on an
-RTX 4090 — 8% of the 10 Hz budget.
+PyTorch reference; ~4.7 ms engine call / ~5.8 ms end-to-end per step on an
+RTX 4090 — 6% of the 10 Hz budget.
+
+## Layout
+
+```
+include/
+  common/       logger, timer, cuda RAII helpers, trajectory types
+  latentdrive/  planner interface + params (the model contract)
+  visualizer/   BEV renderer and camera projector interfaces
+  utils/        npy reader/writer
+src/cpp/
+  common/       logger, timer
+  latentdrive/  PlannerImpl (TensorRT), FrameWindowImpl (preprocessing)
+  visualizer/   BevVisualizerImpl, CameraProjectorImpl
+  main/         gflags mode dispatch (run-package, visualize)
+```
+
+Every module is an interface class plus a `CreateX()` factory; the
+implementation classes stay inside the .cpp files, so consumers see neither
+TensorRT nor CUDA types. GPU resources are held by `common::cuda` unique
+pointers (RAII), errors go through the `logger` macros.
 
 ## Interface
 
 ```cpp
-#include <latentdrive/planner.hpp>
-#include <latentdrive/frame_window.hpp>
+#include "frame_window.hpp"
+#include "planner.hpp"
 
-latentdrive::Planner planner("e2e-fp16-mixed.engine");
-latentdrive::FrameWindow window;              // 16-frame ring buffer @ 10 Hz
+auto planner = model::planner::CreatePlanner("e2e-fp16-mixed.engine");
+auto window  = preprocess::CreateFrameWindow();  // 16-frame ring buffer @ 10 Hz
 
-// camera callback (10 Hz): preprocess each frame exactly once
-window.push(bgr_frame);                       // any resolution; crop+resize+normalize
+// camera callback (10 Hz): each frame is preprocessed exactly once
+window->Push(bgr_frame);          // any resolution; crop + resize + normalize
 
 // planning tick: assemble the 4-slot window and run the engine
-if (window.ready()) {
-  window.assemble(planner.videoInput());      // zero-copy into pinned memory
-  latentdrive::EgoStatus ego{.subgoal_x_m = sx, .subgoal_y_m = sy,
-                             .vel_x = vx, .vel_y = vy, .acc_x = ax, .acc_y = ay};
-  latentdrive::Trajectory traj = planner.inferPrepared(ego.encode());
+if (window->Ready()) {
+  window->Assemble(planner->VideoInput());   // zero-copy into pinned memory
+  common::EgoStatus ego{.subgoal_x_m = sx, .subgoal_y_m = sy,
+                        .vel_x = vx, .vel_y = vy, .acc_x = ax, .acc_y = ay};
+  common::Trajectory traj = planner->ForwardPrepared(ego.Encode());
 }
 ```
 
-`Planner` hides all TensorRT/CUDA types behind a pImpl, so consumers only link
-`latentdrive` and include these headers. Layout:
-
-```
-include/latentdrive/   public interface (types.hpp, planner.hpp, frame_window.hpp)
-src/                   library implementation + internal utils (npy.hpp)
-src/apps/              CLI tools (run_package)
-```
+`visualizer::BevVisualizer` renders trajectories in a bird's-eye view;
+`visualizer::CameraProjector` overlays them on the camera image (pinhole, T4
+calibrated_sensor convention, mandatory 0.5 m depth gate — at a standstill the
+whole plan sits behind the camera and is correctly not drawn). Both draw on
+plain `cv::Mat`, so the ROS 2 node can publish the same canvases as
+`sensor_msgs/Image`.
 
 ## Build
 
-Dependencies: CUDA 12.x, TensorRT 10.x, OpenCV 4, nlohmann-json (apps only).
+Dependencies: CUDA 12.x, TensorRT 10.x, OpenCV 4, gflags, nlohmann-json.
 The deployment container from the training repo has all of them:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release   # -DTENSORRT_ROOT=... for tarball installs
+cmake -B build     # -DTENSORRT_ROOT=... for tarball installs
 cmake --build build -j
 ```
 
-## Validate & benchmark against the hand-off package
+## Run against the hand-off package
 
-`run_package` replays the `workspace/` test package from the training repo —
-9 alignment samples, a preprocessing self-test, 2 streaming clips, and the
+`run-package` replays the `workspace/` test package from the training repo —
+9 alignment samples, a preprocessing self-test, 2 streaming clips and the
 batch-1 latency benchmark — and writes the `.npy` outputs its `validate.py`
 scores:
 
 ```bash
-./build/run_package --engine e2e-fp16-mixed.engine --package /path/to/workspace
+./build/bin/latentdrive-trt --mode=run-package \
+    --engine_file=e2e-fp16-mixed.engine --package_dir=/path/to/workspace
 (cd /path/to/workspace && python3 validate.py)     # expect 11/11
 ```
 
-## Visualization
-
-`BevVisualizer` renders trajectories in a bird's-eye view (x forward = up,
-dark theme matching the benchmark report): prediction vs PyTorch reference vs
-ground truth, subgoal marker, velocity arrow, per-waypoint heading ticks. It
-is pure drawing (`cv::Mat` in, `cv::Mat` out) so a ROS 2 node can publish the
-same canvas as `sensor_msgs/Image`.
-
-`CameraProjector` overlays trajectories on the camera image itself (pinhole,
-T4 calibrated_sensor convention: `p_cam = R^T (p - t)`, waypoints on the z=0
-ground plane, mandatory 0.5 m depth gate — at a standstill the whole plan sits
-behind the camera and is correctly not drawn).
-
-`visualize_sequence` streams a package clip and writes camera (with waypoint
-overlay when `calibration.json` covers the scene) + HUD + BEV as an mp4
-(PNG fallback when OpenCV lacks an encoder):
+`visualize` streams one clip and writes camera (with the waypoint overlay when
+`calibration.json` covers the scene) + HUD + BEV as an mp4:
 
 ```bash
-./build/visualize_sequence --engine e2e-fp16-mixed.engine \
-    --package /path/to/workspace --clip stop_to_launch \
-    --out viz/stop_to_launch.mp4 --png-every 40
-    # --calibration defaults to <package>/calibration.json
+./build/bin/latentdrive-trt --mode=visualize \
+    --engine_file=e2e-fp16-mixed.engine --package_dir=/path/to/workspace \
+    --clip=stop_to_launch --out_video=viz/stop_to_launch.mp4 --png_every=40
 ```
 
 ## Roadmap

@@ -1,45 +1,43 @@
-// TensorRT wrapper around the LatentDrive e2e planner engine.
-//
-// TensorRT/CUDA headers stay out of this interface (pImpl) so downstream
-// consumers -- a ROS 2 node, a visualizer -- only need this header and a link
-// against the latentdrive library.
-#pragma once
+#ifndef __PLANNER_HPP__
+#define __PLANNER_HPP__
 
 #include <array>
 #include <memory>
 #include <string>
 
-#include "latentdrive/types.hpp"
+#include "planner_params.hpp"
+#include "trajectory.hpp"
 
-namespace latentdrive {
+namespace model {
+namespace planner {
 
+// @brief `Planner` class is a interface class, which only exposure the
+// `Forward` pass of the e2e planner engine. TensorRT/CUDA types stay inside
+// the implementation, so a consumer (the ROS 2 node, the visualizer tools)
+// only links against this header
 class Planner {
  public:
-  // Deserializes the engine, allocates pinned host + device buffers, warms
-  // nothing up (call infer() a few times before trusting latency numbers).
-  // Throws std::runtime_error on any TensorRT/CUDA failure.
-  explicit Planner(const std::string& engine_path);
-  ~Planner();
-  Planner(const Planner&) = delete;
-  Planner& operator=(const Planner&) = delete;
+  Planner()          = default;
+  virtual ~Planner() = default;
 
-  // Copies `video` ([3,4,256,512] normalized CHW, oldest..newest) into the
-  // pinned input buffer and runs H2D -> enqueueV3 -> D2H, synchronized.
-  Trajectory infer(const float* video, const std::array<float, kStatusDim>& status);
+  // @brief: Run one plan. `in_video` is the [3, 4, 256, 512] normalized CHW
+  // window (oldest..newest), copied into the pinned input buffer before the
+  // H2D -> enqueueV3 -> D2H round trip (synchronized on return)
+  virtual common::Trajectory Forward(const float                         *in_video,
+                                     const std::array<float, kStatusDim> &in_status) = 0;
 
-  Trajectory infer(const float* video, const EgoStatus& status) {
-    return infer(video, status.encode());
-  }
-
-  // Zero-copy path: write the window straight into this pinned buffer
-  // (e.g. FrameWindow::assemble(planner.videoInput())) then call
-  // inferPrepared(). Saves one 6 MB host memcpy per step.
-  float* videoInput();
-  Trajectory inferPrepared(const std::array<float, kStatusDim>& status);
-
- private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+  // @brief: Zero-copy path. Write the window straight into the pinned buffer
+  // returned by `VideoInput` (e.g. FrameWindow::Assemble(planner->VideoInput()))
+  // and call `ForwardPrepared`, saving one 6 MB host memcpy per step
+  virtual float             *VideoInput()                                                    = 0;
+  virtual common::Trajectory ForwardPrepared(const std::array<float, kStatusDim> &in_status) = 0;
 };
 
-}  // namespace latentdrive
+// @brief: This function is used as a factory to deserialize the engine and
+// generate a Planner object. Returns nullptr when the engine cannot be loaded
+std::shared_ptr<Planner> CreatePlanner(const std::string &engine_path);
+
+}  // namespace planner
+}  // namespace model
+
+#endif  //__PLANNER_HPP__
