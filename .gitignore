@@ -4,3 +4,6 @@ build/
 *.npy
 compile_commands.json
 .cache/
+viz/
+*.mp4
+*.png

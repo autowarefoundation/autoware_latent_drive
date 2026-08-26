@@ -71,8 +71,26 @@ scores:
 (cd /path/to/workspace && python3 validate.py)     # expect 11/11
 ```
 
+## Visualization
+
+`BevVisualizer` renders trajectories in a bird's-eye view (x forward = up,
+dark theme matching the benchmark report): prediction vs PyTorch reference vs
+ground truth, subgoal marker, velocity arrow, per-waypoint heading ticks. It
+is pure drawing (`cv::Mat` in, `cv::Mat` out) so a ROS 2 node can publish the
+same canvas as `sensor_msgs/Image`.
+
+`visualize_sequence` streams a package clip and writes camera + HUD + BEV
+as an mp4 (PNG fallback when OpenCV lacks an encoder):
+
+```bash
+./build/visualize_sequence --engine e2e-fp16-mixed.engine \
+    --package /path/to/workspace --clip stop_to_launch \
+    --out viz/stop_to_launch.mp4 --png-every 40
+```
+
 ## Roadmap
 
 - [x] TensorRT planner wrapper + preprocessing ring buffer
-- [ ] Visualization (waypoint overlay on camera frames)
+- [x] BEV trajectory visualization
+- [ ] Camera-frame waypoint overlay (needs camera calibration)
 - [ ] ROS 2 node
