@@ -36,6 +36,19 @@ constexpr static int kFrameStride = 5;
 constexpr static float kImageNetMean[3] = {0.485f, 0.456f, 0.406f};
 constexpr static float kImageNetStd[3]  = {0.229f, 0.224f, 0.225f};
 
+/****************************************/
+/*********Engine build related***********/
+/****************************************/
+// Layers pinned to fp32 in the fp16 build (the validated mixed-precision
+// recipe). Prefixes match the ONNX node scopes of the planner stage --
+// 713 of 11409 nodes, negligible compute next to the ViT encoder
+constexpr static const char *kFp32LayerPrefixes[] = {
+    "/planner/transformer/",
+    "/planner/trajectory_head/",
+    "/planner/image_fc/",
+    "/planner/status_encoding/",
+};
+
 }  // namespace planner
 }  // namespace model
 

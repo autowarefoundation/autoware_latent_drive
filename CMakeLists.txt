@@ -53,7 +53,11 @@ find_library(
   NVINFER_LIB nvinfer
   HINTS ${TENSORRT_ROOT}
   PATH_SUFFIXES lib lib64)
-if(NOT NVINFER_LIB)
+find_library(
+  NVONNXPARSER_LIB nvonnxparser
+  HINTS ${TENSORRT_ROOT}
+  PATH_SUFFIXES lib lib64)
+if(NOT NVINFER_LIB OR NOT NVONNXPARSER_LIB)
   message(FATAL_ERROR "TensorRT not found (set -DTENSORRT_ROOT=/path/to/TensorRT)")
 endif()
 
@@ -61,6 +65,7 @@ find_library(CUDART_LIB cudart HINTS ${CUDA_DIR}/lib64)
 
 set(LIBS
     ${NVINFER_LIB}
+    ${NVONNXPARSER_LIB}
     ${CUDART_LIB}
     gflags
     pthread

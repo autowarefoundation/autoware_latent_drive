@@ -13,10 +13,12 @@ or JSON — it takes camera frames and ego status, and returns a trajectory.
 | `status` | `[1,6]` | `[subgoal_x/10, subgoal_y/10, vel_x, vel_y, acc_x, acc_y]`, ego frame |
 | `traj` | `[1,8,3]` | 8 waypoints at t+0.5…4.0 s: `(x fwd [m], y left [m], heading [rad])` |
 
-The engine is produced by `deployment/` in the training repo
-(`kalfazed/JEPA-World-model`): ONNX opset 17 → `trtexec --fp16` with the
-planner stage pinned to fp32 (`build_engine.sh`). Validated 11/11 against the
-PyTorch reference; ~4.7 ms engine call / ~5.8 ms end-to-end per step on an
+The ONNX comes from `deployment/export_onnx.py` in the training repo
+(`kalfazed/JEPA-World-model`, opset 17); the engine builds either there via
+`trtexec` or here via `--mode=build-engine` (TensorRT C++ builder API). Both
+apply the same precision recipe — fp16 with the planner stage pinned to fp32 —
+and produce numerically identical results: validated 11/11 against the
+PyTorch reference, ~4.7 ms engine call / ~5.8 ms end-to-end per step on an
 RTX 4090 — 6% of the 10 Hz budget.
 
 ## Layout
@@ -77,6 +79,21 @@ cmake -B build     # -DTENSORRT_ROOT=... for tarball installs
 cmake --build build -j
 ```
 
+## Build the engine from ONNX
+
+`build-engine` parses the ONNX export with nvonnxparser and builds through
+`IBuilder` (TensorRT 10 API). The fp16 build pins the planner-stage layers
+(`kFp32LayerPrefixes` in `planner_params.hpp`) to fp32 under
+`kOBEY_PRECISION_CONSTRAINTS` — the in-framework equivalent of the validated
+trtexec recipe; index/shape layers are skipped since they reject a float
+constraint:
+
+```bash
+./build/bin/latentdrive-trt --mode=build-engine \
+    --onnx_file=e2e-idx8-hist4-e3.onnx --engine_file=e2e-fp16-mixed.engine
+    # --prec=fp32 for the control engine; --pure_fp16 disables the pin (fails validation)
+```
+
 ## Run against the hand-off package
 
 `run-package` replays the `workspace/` test package from the training repo —
@@ -104,4 +121,5 @@ scores:
 - [x] TensorRT planner wrapper + preprocessing ring buffer
 - [x] BEV trajectory visualization
 - [x] Camera-frame waypoint overlay
+- [x] In-framework engine build from ONNX (TensorRT C++ builder API)
 - [ ] ROS 2 node
