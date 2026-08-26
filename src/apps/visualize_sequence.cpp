@@ -20,6 +20,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "latentdrive/bev_visualizer.hpp"
+#include "latentdrive/camera_projector.hpp"
 #include "latentdrive/frame_window.hpp"
 #include "latentdrive/planner.hpp"
 #include "npy.hpp"
@@ -33,6 +34,32 @@ Trajectory rowToTraj(const float* row /* [8,3] */) {
   Trajectory t;
   std::memcpy(t.data(), row, sizeof(Trajectory));
   return t;
+}
+
+// Calibration for this clip's scene, from the package's calibration.json
+// (K_crop_resized matches the 512x256 package JPEGs). nullopt -> no overlay.
+std::optional<CameraProjector> loadProjector(const fs::path& calib_path,
+                                             const std::string& scene) {
+  std::ifstream f(calib_path);
+  if (!f) {
+    std::cerr << "no " << calib_path << " -- camera overlay disabled\n";
+    return std::nullopt;
+  }
+  const auto j = nlohmann::json::parse(f);
+  if (!j["scenes"].contains(scene)) {
+    std::cerr << "scene '" << scene << "' not in calibration.json -- overlay disabled\n";
+    return std::nullopt;
+  }
+  const auto& s = j["scenes"][scene];
+  CameraCalibration c;
+  for (int r = 0; r < 3; ++r) {
+    for (int col = 0; col < 3; ++col) {
+      c.K(r, col) = s["K_crop_resized"][r][col].get<double>();
+      c.R(r, col) = s["extrinsics_camera_to_ego"]["rotation_matrix"][r][col].get<double>();
+    }
+    c.t[r] = s["extrinsics_camera_to_ego"]["translation"][r].get<double>();
+  }
+  return CameraProjector(c);
 }
 
 // camera frame resized to the BEV width, HUD strip, BEV panel — one column
@@ -53,7 +80,7 @@ cv::Mat compose(const cv::Mat& camera, const cv::Mat& bev, const std::string& hu
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string engine_path, package, clip = "follow_lane", out_path;
+  std::string engine_path, package, clip = "follow_lane", out_path, calib_path;
   int fps = 10, png_every = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -61,6 +88,7 @@ int main(int argc, char** argv) {
     else if (a == "--package" && i + 1 < argc) package = argv[++i];
     else if (a == "--clip" && i + 1 < argc) clip = argv[++i];
     else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+    else if (a == "--calibration" && i + 1 < argc) calib_path = argv[++i];
     else if (a == "--fps" && i + 1 < argc) fps = std::stoi(argv[++i]);
     else if (a == "--png-every" && i + 1 < argc) png_every = std::stoi(argv[++i]);
     else {
@@ -74,6 +102,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (out_path.empty()) out_path = "viz_" + clip + ".mp4";
+  if (calib_path.empty()) calib_path = (fs::path(package) / "calibration.json").string();
 
   try {
     const fs::path cdir = fs::path(package) / "sequence" / clip;
@@ -82,6 +111,7 @@ int main(int argc, char** argv) {
     const auto status_all = npy::load((cdir / "status.npy").string());
     const auto ref = npy::load((cdir / "ref_output_fp32.npy").string());
     const auto gt = npy::load((cdir / "gt_target.npy").string());
+    const auto projector = loadProjector(calib_path, seq["scene"].get<std::string>());
 
     Planner planner(engine_path);
     FrameWindow window;
@@ -112,11 +142,19 @@ int main(int argc, char** argv) {
       std::copy_n(status_all.data.begin() + k * kStatusDim, kStatusDim, status.begin());
       const Trajectory pred = planner.inferPrepared(status);
 
+      const Trajectory gt_k = rowToTraj(gt.data.data() + k * kNumWaypoints * 3);
+      const Trajectory ref_k = rowToTraj(ref.data.data() + k * kNumWaypoints * 3);
+
+      if (projector) {  // waypoint overlay on the camera frame (z=0 ground)
+        projector->drawTrajectory(camera, gt_k, bev_color::kGroundTruth, 1,
+                                  /*draw_dots=*/false);
+        projector->drawTrajectory(camera, ref_k, bev_color::kReference, 1);
+        projector->drawTrajectory(camera, pred, bev_color::kPrediction, 2);
+      }
+
       bev.clear();
-      bev.drawTrajectory(rowToTraj(gt.data.data() + k * kNumWaypoints * 3),
-                         bev_color::kGroundTruth, 1);
-      bev.drawTrajectory(rowToTraj(ref.data.data() + k * kNumWaypoints * 3),
-                         bev_color::kReference, 2, /*dashed=*/true);
+      bev.drawTrajectory(gt_k, bev_color::kGroundTruth, 1);
+      bev.drawTrajectory(ref_k, bev_color::kReference, 2, /*dashed=*/true);
       bev.drawTrajectory(pred, bev_color::kPrediction, 2);
       bev.drawSubgoal(status[0] * 10.f, status[1] * 10.f);
       bev.drawVelocity(status[2], status[3]);
