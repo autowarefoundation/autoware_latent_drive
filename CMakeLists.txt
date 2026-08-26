@@ -28,6 +28,7 @@ add_library(latentdrive STATIC
   src/planner.cpp
   src/frame_window.cpp
   src/bev_visualizer.cpp
+  src/camera_projector.cpp
 )
 target_include_directories(latentdrive
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

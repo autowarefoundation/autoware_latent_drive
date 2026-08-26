@@ -79,18 +79,25 @@ ground truth, subgoal marker, velocity arrow, per-waypoint heading ticks. It
 is pure drawing (`cv::Mat` in, `cv::Mat` out) so a ROS 2 node can publish the
 same canvas as `sensor_msgs/Image`.
 
-`visualize_sequence` streams a package clip and writes camera + HUD + BEV
-as an mp4 (PNG fallback when OpenCV lacks an encoder):
+`CameraProjector` overlays trajectories on the camera image itself (pinhole,
+T4 calibrated_sensor convention: `p_cam = R^T (p - t)`, waypoints on the z=0
+ground plane, mandatory 0.5 m depth gate — at a standstill the whole plan sits
+behind the camera and is correctly not drawn).
+
+`visualize_sequence` streams a package clip and writes camera (with waypoint
+overlay when `calibration.json` covers the scene) + HUD + BEV as an mp4
+(PNG fallback when OpenCV lacks an encoder):
 
 ```bash
 ./build/visualize_sequence --engine e2e-fp16-mixed.engine \
     --package /path/to/workspace --clip stop_to_launch \
     --out viz/stop_to_launch.mp4 --png-every 40
+    # --calibration defaults to <package>/calibration.json
 ```
 
 ## Roadmap
 
 - [x] TensorRT planner wrapper + preprocessing ring buffer
 - [x] BEV trajectory visualization
-- [ ] Camera-frame waypoint overlay (needs camera calibration)
+- [x] Camera-frame waypoint overlay
 - [ ] ROS 2 node
