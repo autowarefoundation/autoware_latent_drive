@@ -15,6 +15,7 @@
 
 #include "bev_visualizer.hpp"
 #include "camera_projector.hpp"
+#include "engine_builder.hpp"
 #include "frame_window.hpp"
 #include "logger.hpp"
 #include "npy.hpp"
@@ -29,10 +30,15 @@ namespace planner = model::planner;
 
 // Mode flags
 DEFINE_string(mode, "",
-              "Operating mode (options: run-package, visualize)");
+              "Operating mode (options: build-engine, run-package, visualize)");
 
 // Network flags
 DEFINE_string(engine_file, "", "Path to a serialized TensorRT engine");
+DEFINE_string(onnx_file, "", "Path to the ONNX export (build-engine mode)");
+DEFINE_string(prec, "fp16", "Engine precision (options: fp32, fp16)");
+DEFINE_bool(pure_fp16, false,
+            "Disable the fp32 pin on the planner stage (NOT the validated "
+            "recipe; one golden sample lands 0.4 mm over tolerance)");
 
 // Input data flags
 DEFINE_string(package_dir, "", "Path to the hand-off test package (workspace/)");
@@ -362,15 +368,40 @@ static int Visualize() {
   return 0;
 }
 
+// @brief: This function builds the engine from the ONNX export through the
+// TensorRT C++ API -- the in-framework equivalent of the trtexec recipe
+static int BuildEngine() {
+  if (FLAGS_onnx_file.empty()) {
+    LOGE("--mode=build-engine requires --onnx_file");
+    return 2;
+  }
+  planner::BuildParams params;
+  params.onnx_path        = FLAGS_onnx_file;
+  params.engine_path      = FLAGS_engine_file;
+  params.prec             = planner::GetPrecision(FLAGS_prec);
+  params.pin_planner_fp32 = !FLAGS_pure_fp16;
+  return planner::BuildEngine(params) ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
   gflags::SetUsageMessage(
       "LatentDrive e2e planner TensorRT tools\n"
-      "  --mode=run-package  --engine_file=E --package_dir=DIR   validate + benchmark\n"
-      "  --mode=visualize    --engine_file=E --package_dir=DIR   camera overlay + BEV video");
+      "  --mode=build-engine --onnx_file=O   --engine_file=E       ONNX -> engine\n"
+      "  --mode=run-package  --engine_file=E --package_dir=DIR     validate + benchmark\n"
+      "  --mode=visualize    --engine_file=E --package_dir=DIR     camera overlay + BEV video");
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  if (FLAGS_engine_file.empty() || FLAGS_package_dir.empty()) {
-    LOGE("Both --engine_file and --package_dir are required (see --help)");
+  if (FLAGS_engine_file.empty()) {
+    LOGE("--engine_file is required (see --help)");
+    return 2;
+  }
+
+  if (FLAGS_mode == "build-engine") {
+    return BuildEngine();
+  }
+
+  if (FLAGS_package_dir.empty()) {
+    LOGE("--package_dir is required for --mode=%s", FLAGS_mode.c_str());
     return 2;
   }
 
@@ -380,6 +411,7 @@ int main(int argc, char *argv[]) {
     return Visualize();
   }
 
-  LOGE("Unknown --mode '%s' (options: run-package, visualize)", FLAGS_mode.c_str());
+  LOGE("Unknown --mode '%s' (options: build-engine, run-package, visualize)",
+       FLAGS_mode.c_str());
   return 2;
 }
