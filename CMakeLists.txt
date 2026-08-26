@@ -9,7 +9,7 @@ endif()
 add_compile_options(-Wall -Wextra)
 
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio)
 
 # TensorRT ships no CMake config; locate header + libs directly.
 # TENSORRT_ROOT can point at a tarball install; the deployment container has
@@ -27,6 +27,7 @@ message(STATUS "TensorRT: ${TENSORRT_LIB_NVINFER}")
 add_library(latentdrive STATIC
   src/planner.cpp
   src/frame_window.cpp
+  src/bev_visualizer.cpp
 )
 target_include_directories(latentdrive
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -43,5 +44,9 @@ add_executable(run_package src/apps/run_package.cpp)
 target_include_directories(run_package PRIVATE src)
 target_link_libraries(run_package PRIVATE latentdrive opencv_imgcodecs)
 
-install(TARGETS latentdrive run_package)
+add_executable(visualize_sequence src/apps/visualize_sequence.cpp)
+target_include_directories(visualize_sequence PRIVATE src)
+target_link_libraries(visualize_sequence PRIVATE latentdrive opencv_imgcodecs opencv_videoio)
+
+install(TARGETS latentdrive run_package visualize_sequence)
 install(DIRECTORY include/ DESTINATION include)
