@@ -1,50 +1,49 @@
-// Sliding window of preprocessed camera frames.
-//
-// The model wants 4 frames 0.5 s apart, but the camera delivers 10 Hz; the
-// window therefore keeps the last 3*stride+1 preprocessed frames (16 at the
-// default stride of 5) and assemble() picks every stride-th one. Each frame
-// is preprocessed exactly once, on push -- the ROS 2 image callback maps to
-// push(), the planning tick to assemble().
-#pragma once
+#ifndef __FRAME_WINDOW_HPP__
+#define __FRAME_WINDOW_HPP__
 
-#include <deque>
-#include <vector>
-
+#include <memory>
 #include <opencv2/core.hpp>
 
-#include "latentdrive/types.hpp"
+#include "planner_params.hpp"
 
-namespace latentdrive {
+namespace preprocess {
 
+// @brief `FrameWindow` class is a interface class for the sliding window of
+// preprocessed camera frames. The model wants 4 frames 0.5 s apart while the
+// camera delivers 10 Hz, so the window keeps the last 3*stride+1 preprocessed
+// frames (16 at the default stride) and `Assemble` picks every stride-th one.
+// Each frame is preprocessed exactly once, on `Push` -- in the ROS 2 node the
+// image callback maps to `Push`, the planning tick to `Assemble`
 class FrameWindow {
  public:
-  explicit FrameWindow(int stride_frames = kFrameStride);
+  FrameWindow()          = default;
+  virtual ~FrameWindow() = default;
 
-  // Preprocesses one camera frame (any resolution) and appends it:
-  //   BGR -> RGB, center-crop height to width/2, bilinear resize to 512x256,
-  //   /255, ImageNet-normalize, HWC -> CHW float32.
-  // Pass `is_rgb = true` if the Mat is already RGB (cv::imread gives BGR).
-  void push(const cv::Mat& frame, bool is_rgb = false);
+  // @brief: Preprocess one camera frame (any resolution) and append it:
+  // BGR -> RGB, center-crop the height to width/2, bilinear resize to the
+  // model input, /255, ImageNet-normalize, HWC -> CHW float32.
+  // Set `in_is_rgb` when the Mat is already RGB (cv::imread gives BGR)
+  virtual void Push(const cv::Mat &in_frame, bool in_is_rgb = false) = 0;
 
-  // True once 3*stride+1 frames have been pushed (1.5 s of history at 10 Hz).
-  bool ready() const;
+  // @brief: True once 3*stride+1 frames were pushed (1.5 s of history at 10 Hz)
+  virtual bool Ready() const = 0;
 
-  // Writes the [3,4,256,512] video tensor (oldest..newest slots) to `dst`,
-  // which must hold kVideoNumel floats. Precondition: ready().
-  void assemble(float* dst) const;
+  // @brief: Write the [3, 4, H, W] video tensor (oldest..newest slots) to
+  // `out_video`, which must hold kVideoNumel floats. Precondition: Ready()
+  virtual void Assemble(float *out_video) const = 0;
 
-  void reset();
-  int size() const { return static_cast<int>(frames_.size()); }
-  int capacity() const { return capacity_; }
-
-  // One frame's preprocessing, exposed for testing against the training
-  // pipeline: writes kFrameNumel floats (CHW) to `dst`.
-  static void preprocess(const cv::Mat& frame, float* dst, bool is_rgb = false);
-
- private:
-  int stride_;
-  int capacity_;
-  std::deque<std::vector<float>> frames_;  // each kFrameNumel, CHW
+  virtual void Reset()      = 0;
+  virtual int  Size() const = 0;
 };
 
-}  // namespace latentdrive
+// @brief: This function is used to run the single-frame preprocessing on its
+// own, e.g. to test the pipeline against the training-side reference tensors.
+// `out_chw` must hold kFrameNumel floats. Returns false on an invalid frame
+bool PreprocessFrame(const cv::Mat &in_frame, float *out_chw, bool in_is_rgb = false);
+
+// @brief: This function is used as a factory to generate a FrameWindow object
+std::shared_ptr<FrameWindow> CreateFrameWindow(int stride_frames = model::planner::kFrameStride);
+
+}  // namespace preprocess
+
+#endif  //__FRAME_WINDOW_HPP__
