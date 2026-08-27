@@ -86,12 +86,10 @@ latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
 ```
 
 `run-package` writes the `.npy` outputs the package's `validate.py` scores
-(`python3 validate.py` → 11/11 for the 8-waypoint model). The engine build
-reproduces the validated trtexec recipe in the TensorRT C++ API: the planner
-stage (`kFp32LayerPrefixes` in `planner_params.hpp`) is held at fp32 under
-`kOBEY_PRECISION_CONSTRAINTS`, and index/shape layers are skipped since they
-reject a float constraint. The waypoint count (8 at 2 Hz, 40 at 10 Hz) is read
-from the engine at load, so the same binary serves both checkpoints.
+(`python3 validate.py` → 11/11 for the 8-waypoint model). The waypoint count
+(8 at 2 Hz, 40 at 10 Hz) is read from the engine at load, so the same binary
+serves both checkpoints. The fp16 build's fp32-pin recipe lives in
+`engine_builder.cpp`.
 
 ## Model contract
 
