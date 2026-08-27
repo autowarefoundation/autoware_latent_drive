@@ -74,9 +74,15 @@ node can publish the same canvases as `sensor_msgs/Image`.
 
 ## Environment
 
+Two ways to build and run. The dependencies are the same either way:
+CUDA 12.x, TensorRT 10.x, OpenCV 4, gflags, nlohmann-json, CMake ≥ 3.22, g++
+with C++17.
+
+### Option A — Docker (recommended)
+
 Build and run inside the **pilot-auto.xx1** deployment container, so everything
-links the same CUDA 12.8 / TensorRT 10.8 the vehicle runs. Setup, and the full
-build → engine → validate → visualize walkthrough, are in
+links the same CUDA 12.8 / TensorRT 10.8 the vehicle runs. Setup and the full
+build → engine → validate → visualize walkthrough are in
 [`docker/README.md`](docker/README.md):
 
 ```bash
@@ -84,14 +90,36 @@ build → engine → validate → visualize walkthrough, are in
 DATA=/path/to/workspace ./docker/run.sh           # shell at /workspace, data at /data
 ```
 
-Dependencies (CUDA, TensorRT, OpenCV 4, gflags, nlohmann-json, CMake, g++) are
-all present in that image. A native build works too if they are installed:
-`cmake -B build && cmake --build build -j` (`-DTENSORRT_ROOT=...` for a tarball
-install).
+Every dependency is already in that image; jump straight to `cmake` inside the
+shell it opens.
+
+### Option B — Native (no Docker)
+
+Install the dependencies on the host, then build directly. On Ubuntu the
+distro packages cover everything except the NVIDIA stack:
+
+```bash
+sudo apt install libopencv-dev libgflags-dev nlohmann-json3-dev cmake g++
+```
+
+CUDA and TensorRT come from NVIDIA (apt repo or tarball). Point CMake at the
+TensorRT location if it is not on the default search path:
+
+```bash
+cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # omit if installed system-wide
+cmake --build build -j
+```
+
+This is the right option on the target vehicle, or on any host that already has
+a matching CUDA/TensorRT — the framework itself has no ROS or Docker dependency.
+Just make sure the TensorRT major version matches the one the engine was built
+with (10.x), since serialized engines are not portable across versions.
 
 ## Commands
 
-One binary, `build/bin/latentdrive-trt`, three modes:
+One binary, `build/bin/latentdrive-trt`, three modes. Paths below use the
+Docker mount points (`/data` = the hand-off package, `/workspace` = this repo);
+natively, just pass the real host paths.
 
 ```bash
 # ONNX -> engine (fp16, planner stage pinned to fp32 via IBuilder;
@@ -104,7 +132,7 @@ latentdrive-trt --mode=run-package --engine_file=E.engine --package_dir=/data \
 
 # camera ribbon + BEV mp4
 latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
-    --clip=follow_lane --out_video=/workspace/viz/follow_lane.mp4
+    --clip=follow_lane --out_video=viz/follow_lane.mp4
 ```
 
 `run-package` writes the `.npy` outputs the package's `validate.py` scores
