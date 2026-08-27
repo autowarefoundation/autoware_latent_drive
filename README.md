@@ -5,6 +5,15 @@ Standalone TensorRT C++ inference framework for the LatentDrive e2e planner
 layer the ROS 2 node will sit on: the library knows nothing about ROS, files
 or JSON — it takes camera frames and ego status, and returns a trajectory.
 
+## Demo
+
+![LatentDrive-TRT open-loop replay on an x2dev whole-scene clip](docs/demo.gif)
+
+Open-loop replay of a *decel → red-light → turn* scene. The TensorRT fp16 plan
+(rainbow ribbon, green = now → red = +4 s) is projected onto the front camera
+and drawn in the bird's-eye view, alongside the ground truth and the 50 m
+subgoal. ~5 ms engine latency per 10 Hz step; playback shown at 5× speed.
+
 ## Environment
 
 Two ways to build and run — Docker (matches the vehicle exactly) or a native
