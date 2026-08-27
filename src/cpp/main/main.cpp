@@ -458,13 +458,19 @@ static int Visualize() {
                    frame(cv::Rect(cam_panel.cols + 2, 0, bev_panel.cols, kPanelHeight)));
 
                if (k == 0) {
+                 // VideoWriter does not create the parent directory; without
+                 // this an --out_video into a missing dir fails to open and is
+                 // misreported as "no video encoder"
+                 const fs::path out_parent = fs::path(out_video).parent_path();
+                 if (!out_parent.empty()) fs::create_directories(out_parent);
                  writer.open(out_video, cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
                              FLAGS_fps, frame.size());
                  if (!writer.isOpened()) {
                    use_video = false;
                    png_dir   = fs::path(out_video).replace_extension("");
                    fs::create_directories(png_dir);
-                   LOGW("No video encoder; writing PNGs to %s", png_dir.c_str());
+                   LOGW("VideoWriter could not open %s (no encoder?); writing PNGs to %s",
+                        out_video.c_str(), png_dir.c_str());
                  }
                }
                if (use_video) {
