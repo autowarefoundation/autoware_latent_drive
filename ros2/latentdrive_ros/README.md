@@ -71,8 +71,49 @@ ros2 launch latentdrive_ros replay.launch.py \
     route:=/path/to/bag_dir/route.npy
 ```
 
-`scripts/grab_viz.py --count N` saves N frames of `~/viz` as PNGs for a quick
-headless check.
+## Live window from the host (X11)
+
+To watch the camera + BEV window on your desktop, forward X11 into the
+container (the container's OpenCV is headless, so the window comes from
+`rqt_image_view`, which the launch file starts for you).
+
+From the host, in the repo root:
+
+```bash
+# 1. allow the container to reach your X server (once per login)
+xhost +local:docker
+
+# 2. start the container with X11 + the bag mounted (docker/run.sh does both).
+#    BAG is mounted at /bag, the repo at /workspace.
+BAG=/path/to/bag_dir ./docker/run.sh
+```
+
+Then inside the container shell it drops you into:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /workspace/ros2/install/setup.bash    # colcon build first if never built
+ros2 launch latentdrive_ros replay.launch.py \
+    bag:=/bag \
+    engine:=/workspace/models/engine/e2e-wp10hz-fp16-mixed.engine \
+    calibration:=/workspace/sample_data/calibration.json \
+    route:=/bag/route.npy
+```
+
+An `rqt_image_view` window pops up on your desktop showing the live camera
+ribbon + BEV. `display:=false` disables it (headless); `rate:=2.0` plays faster.
+
+Prep the bag once beforehand (see above): `ros2 bag reindex /bag -s sqlite3`
+and `export_route.py /bag`.
+
+**If the window doesn't appear:** re-run `xhost +local:docker` on the host and
+check `echo $DISPLAY` is non-empty before starting the container. `NO_X11=1`
+skips the X11 plumbing entirely.
+
+## Headless check
+
+`scripts/grab_viz.py --count N` saves N frames of `~/viz` as PNGs — useful over
+SSH or when no display is available.
 
 ## Parameters
 
