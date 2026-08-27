@@ -51,13 +51,17 @@ args=(
 
 if [ -n "${DATA:-}" ]; then
     args+=(-v "$DATA:/data")
-else
-    echo "note: DATA is unset; the build-engine/run-package/visualize commands" >&2
-    echo "      need the hand-off package mounted, e.g. DATA=/path/to/workspace" >&2
 fi
 
 if [ -n "${BAG:-}" ]; then
     args+=(-v "$BAG:/bag")
+fi
+
+# Only nag about mounts when nothing is mounted at all -- with BAG set this is
+# a ROS 2 replay run (data comes from the repo + /bag), so DATA isn't needed.
+if [ -z "${DATA:-}" ] && [ -z "${BAG:-}" ]; then
+    echo "note: neither DATA nor BAG is set. Mount the hand-off package with" >&2
+    echo "      DATA=/path/to/workspace (CLI) or a rosbag with BAG=/path (ROS 2)." >&2
 fi
 
 # X11 for GUI windows (rqt_image_view). Run `xhost +local:docker` once on the
