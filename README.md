@@ -42,16 +42,19 @@ sudo apt install libopencv-dev libgflags-dev nlohmann-json3-dev cmake g++
 
 Install **CUDA 12.8** and **TensorRT 10.8.0.43** from NVIDIA (apt repo or
 tarball) — the same versions the deployment container pins, so an engine built
-here loads on the vehicle; cuDNN is not needed. Then build, pointing CMake at
-TensorRT if it is not on the default search path:
+here loads on the vehicle; cuDNN is not needed. Then build:
 
 ```bash
-cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # omit if installed system-wide
+cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # or export TENSORRT_ROOT; omit if system-wide
 cmake --build build -j
 ```
 
-The framework has no ROS or Docker dependency, so this is also how it builds on
-the target vehicle.
+`TENSORRT_ROOT` may be a `-D` flag or an environment variable (a tarball's
+headers and libs are picked up from `$TENSORRT_ROOT/{include,lib}`). If the
+`/usr/local/cuda` symlink points at a toolkit other than the one TensorRT was
+built for, pin it explicitly, e.g. `-DCUDA_DIR=/usr/local/cuda-12.8`. The
+framework has no ROS or Docker dependency, so this is also how it builds on the
+target vehicle.
 
 ## Commands
 

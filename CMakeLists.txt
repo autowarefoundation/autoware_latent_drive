@@ -11,7 +11,18 @@ endif()
 # ==============================================================================
 set(SRC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set(CUDA_DIR "/usr/local/cuda")
+
+# CUDA install to link against; override with -DCUDA_DIR=/usr/local/cuda-12.8
+# when the default symlink points at a different toolkit than the engine needs
+if(NOT CUDA_DIR)
+  set(CUDA_DIR "/usr/local/cuda")
+endif()
+
+# TensorRT root: -DTENSORRT_ROOT=..., else the TENSORRT_ROOT env var (set by the
+# shell rc for a native build), else the system search paths inside the container
+if(NOT TENSORRT_ROOT AND DEFINED ENV{TENSORRT_ROOT})
+  set(TENSORRT_ROOT $ENV{TENSORRT_ROOT})
+endif()
 
 # ==============================================================================
 # Collect source files
@@ -46,9 +57,14 @@ endforeach()
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-# TensorRT ships no CMake config; locate the library directly. TENSORRT_ROOT
-# can point at a tarball install; the deployment container has it in the
-# default system paths
+# TensorRT ships no CMake config; locate the headers and libraries directly.
+# TENSORRT_ROOT can point at a tarball install; the deployment container has it
+# in the default system paths. The include dir is put first so a tarball's
+# headers win over any older TensorRT installed system-wide
+find_path(
+  TENSORRT_INCLUDE_DIR NvInfer.h
+  HINTS ${TENSORRT_ROOT}
+  PATH_SUFFIXES include)
 find_library(
   NVINFER_LIB nvinfer
   HINTS ${TENSORRT_ROOT}
@@ -57,9 +73,11 @@ find_library(
   NVONNXPARSER_LIB nvonnxparser
   HINTS ${TENSORRT_ROOT}
   PATH_SUFFIXES lib lib64)
-if(NOT NVINFER_LIB OR NOT NVONNXPARSER_LIB)
+if(NOT TENSORRT_INCLUDE_DIR OR NOT NVINFER_LIB OR NOT NVONNXPARSER_LIB)
   message(FATAL_ERROR "TensorRT not found (set -DTENSORRT_ROOT=/path/to/TensorRT)")
 endif()
+message(STATUS "TensorRT: ${TENSORRT_INCLUDE_DIR} | ${NVINFER_LIB}")
+include_directories(BEFORE ${TENSORRT_INCLUDE_DIR})
 
 find_library(CUDART_LIB cudart HINTS ${CUDA_DIR}/lib64)
 
