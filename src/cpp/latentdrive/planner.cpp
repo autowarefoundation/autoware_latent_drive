@@ -65,20 +65,30 @@ class PlannerImpl : public Planner {
       }
     }
 
+    // The waypoint count is a property of the checkpoint (8 at 2 Hz, 40 at
+    // 10 Hz), so it is read from the engine instead of being compiled in
+    const nvinfer1::Dims traj_dims = engine_->getTensorShape(kTrajTensorName);
+    if (traj_dims.nbDims != 3 || traj_dims.d[0] != 1 || traj_dims.d[2] != 3) {
+      LOGE("Unexpected traj shape (want [1, N, 3])");
+      return false;
+    }
+    num_waypoints_ = static_cast<int>(traj_dims.d[1]);
+
     CUDA_CHECK(cudaStreamCreate(&stream_));
 
-    host_video_  = common::cuda::MakeHostMemory<float>(kVideoNumel * sizeof(float));
-    host_status_ = common::cuda::MakeHostMemory<float>(kStatusDim * sizeof(float));
-    host_traj_   = common::cuda::MakeHostMemory<float>(kOutputNumel * sizeof(float));
-    dev_video_   = common::cuda::MakeDeviceMemory<float>(kVideoNumel * sizeof(float));
-    dev_status_  = common::cuda::MakeDeviceMemory<float>(kStatusDim * sizeof(float));
-    dev_traj_    = common::cuda::MakeDeviceMemory<float>(kOutputNumel * sizeof(float));
+    const std::size_t traj_bytes = static_cast<std::size_t>(num_waypoints_) * 3 * sizeof(float);
+    host_video_                  = common::cuda::MakeHostMemory<float>(kVideoNumel * sizeof(float));
+    host_status_                 = common::cuda::MakeHostMemory<float>(kStatusDim * sizeof(float));
+    host_traj_                   = common::cuda::MakeHostMemory<float>(traj_bytes);
+    dev_video_                   = common::cuda::MakeDeviceMemory<float>(kVideoNumel * sizeof(float));
+    dev_status_                  = common::cuda::MakeDeviceMemory<float>(kStatusDim * sizeof(float));
+    dev_traj_                    = common::cuda::MakeDeviceMemory<float>(traj_bytes);
 
     context_->setTensorAddress(kVideoTensorName, dev_video_.get());
     context_->setTensorAddress(kStatusTensorName, dev_status_.get());
     context_->setTensorAddress(kTrajTensorName, dev_traj_.get());
 
-    LOG("Deserialized %s", engine_path.c_str());
+    LOG("Deserialized %s (%d waypoints)", engine_path.c_str(), num_waypoints_);
     return true;
   }
 
@@ -93,6 +103,7 @@ class PlannerImpl : public Planner {
   common::Trajectory ForwardPrepared(const std::array<float, kStatusDim> &in_status) final {
     std::memcpy(host_status_.get(), in_status.data(), kStatusDim * sizeof(float));
 
+    const std::size_t traj_bytes = static_cast<std::size_t>(num_waypoints_) * 3 * sizeof(float);
     CUDA_CHECK(cudaMemcpyAsync(dev_video_.get(), host_video_.get(),
                                kVideoNumel * sizeof(float),
                                cudaMemcpyHostToDevice, stream_));
@@ -102,19 +113,21 @@ class PlannerImpl : public Planner {
     if (!context_->enqueueV3(stream_)) {
       LOGF("enqueueV3 failed");
     }
-    CUDA_CHECK(cudaMemcpyAsync(host_traj_.get(), dev_traj_.get(),
-                               kOutputNumel * sizeof(float),
+    CUDA_CHECK(cudaMemcpyAsync(host_traj_.get(), dev_traj_.get(), traj_bytes,
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-    common::Trajectory out_traj;
-    static_assert(sizeof(common::Trajectory) == kOutputNumel * sizeof(float));
-    std::memcpy(out_traj.data(), host_traj_.get(), sizeof(common::Trajectory));
+    static_assert(sizeof(common::Waypoint) == 3 * sizeof(float));
+    common::Trajectory out_traj(num_waypoints_);
+    std::memcpy(out_traj.data(), host_traj_.get(), traj_bytes);
     return out_traj;
   }
 
+  int NumWaypoints() const final { return num_waypoints_; }
+
  private:
-  cudaStream_t stream_ = nullptr;
+  cudaStream_t stream_        = nullptr;
+  int          num_waypoints_ = 0;
 
   common::cuda::cuda_host_unique_ptr<float> host_video_  = nullptr;
   common::cuda::cuda_host_unique_ptr<float> host_status_ = nullptr;

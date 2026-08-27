@@ -2,10 +2,9 @@
 #define __TRAJECTORY_HPP__
 
 #include <array>
+#include <vector>
 
 namespace common {
-
-constexpr static int kNumWaypoints = 8;  // planner horizon: t+0.5 .. t+4.0 s
 
 // Ego frame convention throughout: x forward [m], y left [m], heading [rad],
 // heading 0 = straight ahead. The frame is the ego pose at inference time
@@ -15,8 +14,10 @@ struct Waypoint {
   float heading;
 };
 
-// One plan: 8 waypoints, 0.5 s apart
-using Trajectory = std::array<Waypoint, kNumWaypoints>;
+// One plan over a 4 s horizon. The waypoint count is a property of the
+// engine, not of this framework: 8 at 2 Hz for e2e-idx8-hist4, 40 at 10 Hz
+// for the -wp10hz variant. Planner::NumWaypoints() reports it after load
+using Trajectory = std::vector<Waypoint>;
 
 // @brief Ego status in physical units. `Encode` applies the training-time
 // layout: the subgoal (route point 50 m of arc length ahead, ego frame) is

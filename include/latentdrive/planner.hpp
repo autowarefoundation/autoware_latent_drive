@@ -31,6 +31,10 @@ class Planner {
   // and call `ForwardPrepared`, saving one 6 MB host memcpy per step
   virtual float             *VideoInput()                                                    = 0;
   virtual common::Trajectory ForwardPrepared(const std::array<float, kStatusDim> &in_status) = 0;
+
+  // @brief: Waypoint count of the loaded engine ([1, N, 3] output): 8 for the
+  // 2 Hz checkpoints, 40 for the 10 Hz ones. The horizon is 4 s either way
+  virtual int NumWaypoints() const = 0;
 };
 
 // @brief: This function is used as a factory to deserialize the engine and
