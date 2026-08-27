@@ -22,9 +22,11 @@ constexpr static int kInputWidth    = 512;
 constexpr static int kNumHistFrames = 4;  // video slots, oldest..newest, 0.5 s apart
 constexpr static int kStatusDim     = 6;
 
-constexpr static int kFrameNumel  = 3 * kInputHeight * kInputWidth;  // one CHW frame
-constexpr static int kVideoNumel  = kFrameNumel * kNumHistFrames;    // [3, 4, H, W]
-constexpr static int kOutputNumel = common::kNumWaypoints * 3;       // [8, 3]
+constexpr static int kFrameNumel = 3 * kInputHeight * kInputWidth;  // one CHW frame
+constexpr static int kVideoNumel = kFrameNumel * kNumHistFrames;    // [3, 4, H, W]
+
+// The output is [1, N, 3] with N read from the engine at load time -- the
+// waypoint count differs between checkpoints (8 at 2 Hz, 40 at 10 Hz)
 
 /****************************************/
 /**********Preprocess related************/

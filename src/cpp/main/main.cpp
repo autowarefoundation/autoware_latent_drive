@@ -49,16 +49,19 @@ DEFINE_string(calibration_file, "",
 // Output flags
 DEFINE_string(out_name, "engine_output.npy",
               "File name of the per-input outputs written next to the references");
+DEFINE_string(ref_name, "ref_output_fp32.npy",
+              "File name of the PyTorch reference outputs to compare against; "
+              "references whose waypoint count differs from the engine are skipped");
 DEFINE_string(out_video, "", "Output video path (default: viz_<clip>.mp4)");
 DEFINE_int32(fps, 10, "Frames per second of the output video");
 DEFINE_int32(png_every, 0, "Also dump a standalone PNG still every N steps (0 = off)");
 DEFINE_bool(skip_benchmark, false, "Skip the latency benchmark in run-package mode");
 
 // @brief: This function is used to compute the largest per-waypoint xy
-// deviation [m] between a plan and its reference row
+// deviation [m] between a plan and its reference row of the same length
 static double MaxXyError(const common::Trajectory &in_traj, const float *in_ref) {
   double worst = 0;
-  for (int i = 0; i < common::kNumWaypoints; ++i) {
+  for (std::size_t i = 0; i < in_traj.size(); ++i) {
     const double dx = in_traj[i].x - in_ref[i * 3 + 0];
     const double dy = in_traj[i].y - in_ref[i * 3 + 1];
     worst           = std::max(worst, std::hypot(dx, dy));
@@ -66,9 +69,9 @@ static double MaxXyError(const common::Trajectory &in_traj, const float *in_ref)
   return worst;
 }
 
-static common::Trajectory RowToTrajectory(const float *in_row /* [8, 3] */) {
-  common::Trajectory traj;
-  std::memcpy(traj.data(), in_row, sizeof(common::Trajectory));
+static common::Trajectory RowToTrajectory(const float *in_row, int in_num_waypoints) {
+  common::Trajectory traj(in_num_waypoints);
+  std::memcpy(traj.data(), in_row, in_num_waypoints * 3 * sizeof(float));
   return traj;
 }
 
@@ -180,18 +183,28 @@ static int RunPackage() {
 
   const fs::path package(FLAGS_package_dir);
 
+  const auto num_waypoints = static_cast<std::size_t>(planner_ptr->NumWaypoints());
+
   LOG("== samples/ (packaged video.npy)");
   for (const auto &sample_dir : SortedDirs(package / "samples")) {
     const auto video  = utils::LoadNpy((sample_dir / "video.npy").string());
     const auto status = utils::LoadNpy((sample_dir / "status.npy").string());
-    const auto ref    = utils::LoadNpy((sample_dir / "ref_output_fp32.npy").string());
 
     std::array<float, planner::kStatusDim> status_arr;
     std::copy_n(status.data.begin(), planner::kStatusDim, status_arr.begin());
 
     const common::Trajectory traj = planner_ptr->Forward(video.data.data(), status_arr);
     utils::SaveNpy((sample_dir / FLAGS_out_name).string(), &traj[0].x,
-                   {common::kNumWaypoints, 3});
+                   {num_waypoints, 3});
+
+    const fs::path ref_path = sample_dir / FLAGS_ref_name;
+    if (!fs::exists(ref_path) ||
+        utils::LoadNpy(ref_path.string()).shape[0] != num_waypoints) {
+      LOG("  %-32s (no %s with %zu waypoints -- comparison skipped)",
+          sample_dir.filename().c_str(), FLAGS_ref_name.c_str(), num_waypoints);
+      continue;
+    }
+    const auto ref = utils::LoadNpy(ref_path.string());
     LOG("  %-32s xy max vs ref %.4f m", sample_dir.filename().c_str(),
         MaxXyError(traj, ref.data.data()));
   }
@@ -228,7 +241,7 @@ static int RunPackage() {
 
   LOG("== sequence/ (streaming from frames/*.jpg)");
   for (const auto &clip_dir : SortedDirs(package / "sequence")) {
-    const auto ref = utils::LoadNpy((clip_dir / "ref_output_fp32.npy").string());
+    const std::size_t row_numel = num_waypoints * 3;
 
     timer::Timer       timer;
     std::vector<float> plans;
@@ -236,22 +249,35 @@ static int RunPackage() {
                [&](std::size_t k, const nlohmann::json &,
                    const std::array<float, planner::kStatusDim> &,
                    const common::Trajectory &pred, const cv::Mat &) {
-                 plans.insert(plans.end(), &pred[0].x, &pred[0].x + planner::kOutputNumel);
+                 plans.insert(plans.end(), &pred[0].x, &pred[0].x + row_numel);
                  // The first steps carry the window pre-fill (16 decodes) and
                  // engine warmup transients; benchmark steps 5..n only
                  if (k == 4) timer.Reset();
                });
 
-    const std::size_t n_steps = plans.size() / planner::kOutputNumel;
+    const std::size_t n_steps = plans.size() / row_numel;
     utils::SaveNpy((clip_dir / FLAGS_out_name).string(), plans.data(),
-                   {n_steps, common::kNumWaypoints, 3});
+                   {n_steps, num_waypoints, 3});
 
-    double worst = 0;
-    for (std::size_t k = 0; k < n_steps; ++k) {
-      worst = std::max(worst, MaxXyError(RowToTrajectory(plans.data() + k * planner::kOutputNumel),
-                                         ref.data.data() + k * planner::kOutputNumel));
+    const fs::path ref_path = clip_dir / FLAGS_ref_name;
+    bool           compared = false;
+    if (fs::exists(ref_path)) {
+      const auto ref = utils::LoadNpy(ref_path.string());
+      if (ref.shape.size() == 3 && ref.shape[1] == num_waypoints) {
+        double worst = 0;
+        for (std::size_t k = 0; k < n_steps; ++k) {
+          worst = std::max(worst,
+                           MaxXyError(RowToTrajectory(plans.data() + k * row_numel, num_waypoints),
+                                      ref.data.data() + k * row_numel));
+        }
+        LOG("  %-16s %zu steps  xy max vs ref %.4f m", clip_dir.filename().c_str(), n_steps, worst);
+        compared = true;
+      }
     }
-    LOG("  %-16s %zu steps  xy max vs ref %.4f m", clip_dir.filename().c_str(), n_steps, worst);
+    if (!compared) {
+      LOG("  %-16s %zu steps  (no %s with %zu waypoints -- comparison skipped)",
+          clip_dir.filename().c_str(), n_steps, FLAGS_ref_name.c_str(), num_waypoints);
+    }
 
     if (!FLAGS_skip_benchmark && clip_dir.filename() == "follow_lane") {
       LOG("== benchmark (%s, batch 1, warm cache excluded by design of the clip)",
@@ -272,8 +298,21 @@ static int Visualize() {
   if (!planner_ptr || !window_ptr || !bev_ptr) return 1;
 
   const fs::path clip_dir = fs::path(FLAGS_package_dir) / "sequence" / FLAGS_clip;
-  const auto     ref      = utils::LoadNpy((clip_dir / "ref_output_fp32.npy").string());
+  const auto     ref      = fs::exists(clip_dir / FLAGS_ref_name)
+                                ? utils::LoadNpy((clip_dir / FLAGS_ref_name).string())
+                                : utils::NpyArray{};
   const auto     gt       = utils::LoadNpy((clip_dir / "gt_target.npy").string());
+
+  // A reference/gt trajectory only overlays when its waypoint count matches
+  // the engine's; the 8-waypoint package files stay useful for the 2 Hz
+  // checkpoints and are skipped for the 10 Hz ones
+  const auto num_waypoints = static_cast<std::size_t>(planner_ptr->NumWaypoints());
+  const bool ref_usable    = ref.shape.size() == 3 && ref.shape[1] == num_waypoints;
+  const bool gt_usable     = gt.shape.size() == 3 && gt.shape[1] == num_waypoints;
+  if (!ref_usable) {
+    LOGW("%s has %zu waypoints, engine %zu -- reference overlay disabled",
+         FLAGS_ref_name.c_str(), ref.shape.size() == 3 ? ref.shape[1] : 0, num_waypoints);
+  }
 
   std::ifstream json_file(clip_dir / "sequence.json");
   const auto    sequence = nlohmann::json::parse(json_file);
@@ -296,25 +335,34 @@ static int Visualize() {
              [&](std::size_t k, const nlohmann::json &step,
                  const std::array<float, planner::kStatusDim> &status,
                  const common::Trajectory &pred, const cv::Mat &camera_in) {
-               const common::Trajectory gt_k  = RowToTrajectory(gt.data.data() + k * planner::kOutputNumel);
-               const common::Trajectory ref_k = RowToTrajectory(ref.data.data() + k * planner::kOutputNumel);
+               const std::size_t row_numel = num_waypoints * 3;
 
                cv::Mat camera = camera_in.clone();
+               bev_ptr->Clear();
+
+               if (gt_usable) {
+                 const auto gt_k = RowToTrajectory(gt.data.data() + k * row_numel, num_waypoints);
+                 if (projector_ptr) {
+                   projector_ptr->DrawTrajectory(camera, gt_k, visualizer::color::kGroundTruth, 1, false);
+                 }
+                 bev_ptr->DrawTrajectory(gt_k, visualizer::color::kGroundTruth, 1);
+                 bev_ptr->AddLegend("ground truth", visualizer::color::kGroundTruth);
+               }
+               if (ref_usable) {
+                 const auto ref_k = RowToTrajectory(ref.data.data() + k * row_numel, num_waypoints);
+                 if (projector_ptr) {
+                   projector_ptr->DrawTrajectory(camera, ref_k, visualizer::color::kReference, 1);
+                 }
+                 bev_ptr->DrawTrajectory(ref_k, visualizer::color::kReference, 2, true);
+                 bev_ptr->AddLegend("PyTorch ref", visualizer::color::kReference);
+               }
                if (projector_ptr) {
-                 projector_ptr->DrawTrajectory(camera, gt_k, visualizer::color::kGroundTruth, 1, false);
-                 projector_ptr->DrawTrajectory(camera, ref_k, visualizer::color::kReference, 1);
                  projector_ptr->DrawTrajectory(camera, pred, visualizer::color::kPrediction, 2);
                }
-
-               bev_ptr->Clear();
-               bev_ptr->DrawTrajectory(gt_k, visualizer::color::kGroundTruth, 1);
-               bev_ptr->DrawTrajectory(ref_k, visualizer::color::kReference, 2, true);
                bev_ptr->DrawTrajectory(pred, visualizer::color::kPrediction, 2);
                bev_ptr->DrawSubgoal(status[0] * 10.f, status[1] * 10.f);
                bev_ptr->DrawVelocity(status[2], status[3]);
                bev_ptr->AddLegend("TRT fp16 pred", visualizer::color::kPrediction);
-               bev_ptr->AddLegend("PyTorch ref", visualizer::color::kReference);
-               bev_ptr->AddLegend("ground truth", visualizer::color::kGroundTruth);
                bev_ptr->AddLegend("subgoal 50m", visualizer::color::kSubgoal);
 
                // Compose one column: camera resized to the BEV width, a HUD
@@ -326,12 +374,15 @@ static int Visualize() {
                           0, 0, cv::INTER_AREA);
 
                const float speed = std::hypot(status[2], status[3]);
-               const float wp8   = std::hypot(pred[7].x, pred[7].y);
-               const auto  hud   = cv::format(
-                   "%3zu/%d %s  v %4.1f  wp8 %5.2fm  err %.3f", k,
+               const float wp_4s = std::hypot(pred.back().x, pred.back().y);
+               std::string hud   = cv::format(
+                   "%3zu/%d %s  v %4.1f  wp4s %5.2fm", k,
                    sequence["n_steps"].get<int>() - 1,
-                   step["phase"].get<std::string>().c_str(), speed, wp8,
-                   MaxXyError(pred, ref.data.data() + k * planner::kOutputNumel));
+                   step["phase"].get<std::string>().c_str(), speed, wp_4s);
+               if (ref_usable) {
+                 hud += cv::format("  err %.3f",
+                                   MaxXyError(pred, ref.data.data() + k * row_numel));
+               }
 
                const int kHudHeight = 26;
                cv::Mat   frame(camera_resized.rows + kHudHeight + bev.rows, bev.cols,
