@@ -76,7 +76,21 @@ find_library(
 if(NOT TENSORRT_INCLUDE_DIR OR NOT NVINFER_LIB OR NOT NVONNXPARSER_LIB)
   message(FATAL_ERROR "TensorRT not found (set -DTENSORRT_ROOT=/path/to/TensorRT)")
 endif()
-message(STATUS "TensorRT: ${TENSORRT_INCLUDE_DIR} | ${NVINFER_LIB}")
+
+# Guard against an older TensorRT installed system-wide silently winning when
+# TENSORRT_ROOT is unset -- an 8.x header fails deep in the build (no kINT64),
+# and linking the wrong major is worse. Fail loudly at configure time instead
+file(STRINGS "${TENSORRT_INCLUDE_DIR}/NvInferVersion.h" _trt_major_line
+     REGEX "define NV_TENSORRT_MAJOR")
+string(REGEX MATCH "[0-9]+" TENSORRT_MAJOR "${_trt_major_line}")
+if(TENSORRT_MAJOR LESS 10)
+  message(FATAL_ERROR
+    "Found TensorRT ${TENSORRT_MAJOR} at ${TENSORRT_INCLUDE_DIR}, but this "
+    "project needs >= 10. Point it at a 10.x install with "
+    "-DTENSORRT_ROOT=/path/to/TensorRT-10.x (or export TENSORRT_ROOT).")
+endif()
+
+message(STATUS "TensorRT ${TENSORRT_MAJOR}: ${TENSORRT_INCLUDE_DIR} | ${NVINFER_LIB}")
 include_directories(BEFORE ${TENSORRT_INCLUDE_DIR})
 
 find_library(CUDART_LIB cudart HINTS ${CUDA_DIR}/lib64)
