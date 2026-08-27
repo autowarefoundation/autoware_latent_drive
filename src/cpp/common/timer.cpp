@@ -28,6 +28,11 @@ double Timer::Percentile(const std::string &msg, double percentile) const {
   return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
 }
 
+double Timer::Last(const std::string &msg) const {
+  const auto it = samples_.find(msg);
+  return (it == samples_.end() || it->second.empty()) ? 0.0 : it->second.back();
+}
+
 int Timer::SampleCount(const std::string &msg) const {
   const auto it = samples_.find(msg);
   return it == samples_.end() ? 0 : static_cast<int>(it->second.size());

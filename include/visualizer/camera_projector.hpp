@@ -41,6 +41,14 @@ class CameraProjector {
   virtual void DrawTrajectory(cv::Mat &inout_image, const common::Trajectory &in_traj,
                               const cv::Scalar &in_color, int in_thickness = 2,
                               bool in_draw_dots = true) const = 0;
+
+  // @brief: Filled ground-plane corridor through the waypoints, colored along
+  // the horizon (green at the near/now end -> red at the far/+4 s end) and
+  // alpha-blended over the road. `in_half_width_m` is the lateral half-width
+  // of the corridor in the ego ground plane. This is the primary prediction
+  // overlay; DrawTrajectory stays for the thin ground-truth line
+  virtual void DrawRibbon(cv::Mat &inout_image, const common::Trajectory &in_traj,
+                          double in_half_width_m = 0.9, double in_alpha = 0.45) const = 0;
 };
 
 // @brief: This function is used as a factory to generate a CameraProjector object
