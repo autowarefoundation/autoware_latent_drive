@@ -1,9 +1,9 @@
 # LatentDrive-TRT
 
 Standalone TensorRT C++ inference framework for the LatentDrive e2e planner
-(`e2e-idx8-hist4`: V-JEPA2 ViT-L encoder + planner transformer). This is the
-layer the ROS 2 node will sit on: the library knows nothing about ROS, files
-or JSON — it takes camera frames and ego status, and returns a trajectory.
+(a V-JEPA2 ViT-L encoder feeding a planner transformer). This is the layer the
+ROS 2 node will sit on: the library knows nothing about ROS, files or JSON —
+it takes camera frames and ego status, and returns a trajectory.
 
 ## Demo
 
