@@ -130,15 +130,8 @@ if (window->Ready()) {
 }
 ```
 
-`visualizer::CameraProjector` overlays the plan on the camera image (pinhole,
-T4 calibrated_sensor convention, mandatory 0.5 m depth gate — at a standstill
-the whole plan sits behind the camera and is correctly not drawn):
-`DrawRibbon` fills a ground-plane corridor colored along the horizon
-(green = now → red = +4 s, the `HorizonColor` ramp), `DrawTrajectory` adds the
-thin white ground-truth line. `visualizer::BevVisualizer` renders the same plan
-in a bird's-eye view with `DrawTrajectoryHorizon` (matching gradient), plus the
-subgoal marker and velocity arrow. Both draw on plain `cv::Mat`, so the ROS 2
-node can publish the same canvases as `sensor_msgs/Image`.
+The visualizers (`BevVisualizer`, `CameraProjector`) draw on plain `cv::Mat`,
+so a node can publish the same canvas as `sensor_msgs/Image`.
 
 ## Codebase layout
 
