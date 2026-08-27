@@ -166,4 +166,4 @@ pointers (RAII), errors go through the `logger` macros.
 - [x] BEV trajectory visualization
 - [x] Camera-frame waypoint overlay
 - [x] In-framework engine build from ONNX (TensorRT C++ builder API)
-- [ ] ROS 2 node
+- [x] ROS 2 node — open-loop rosbag replay ([`ros2/latentdrive_ros`](ros2/latentdrive_ros))
