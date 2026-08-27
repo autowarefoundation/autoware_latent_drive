@@ -15,6 +15,7 @@
 
 #include "bev_visualizer.hpp"
 #include "camera_projector.hpp"
+#include "color_map.hpp"
 #include "engine_builder.hpp"
 #include "frame_window.hpp"
 #include "logger.hpp"
@@ -288,9 +289,45 @@ static int RunPackage() {
   return 0;
 }
 
-// @brief: This function streams one clip and renders each step as camera
-// frame (with the waypoint overlay when calibration covers the scene) + HUD
-// + BEV, written as an mp4 (PNG directory when no video encoder is built in)
+// @brief: This function is used to draw a translucent dark HUD panel with a
+// list of (label, value, value-color) rows in the top-left of `inout_panel`.
+// The label is muted gray, the value carries the color -- so the deployment
+// numbers (latency, accuracy) read at a glance
+static void DrawHud(cv::Mat                                       &inout_panel,
+                    const std::vector<std::array<std::string, 2>> &rows,
+                    const std::vector<cv::Scalar>                 &value_colors) {
+  constexpr int    kFont     = cv::FONT_HERSHEY_DUPLEX;
+  constexpr double kScale    = 0.5;
+  constexpr int    kLineH    = 26;
+  constexpr int    kPadX     = 14;
+  constexpr int    kPadY     = 20;
+  constexpr int    kLabelW   = 96;
+  const cv::Scalar kLabelInk = {150, 150, 150};
+
+  int max_w = 0;
+  for (const auto &row : rows) {
+    const cv::Size sz = cv::getTextSize(row[1], kFont, kScale, 1, nullptr);
+    max_w             = std::max(max_w, kLabelW + sz.width);
+  }
+  const int panel_w = kLabelW + max_w + kPadX;
+  const int panel_h = kPadY + static_cast<int>(rows.size()) * kLineH;
+
+  cv::Mat roi = inout_panel(cv::Rect(0, 0, std::min(panel_w + kPadX, inout_panel.cols),
+                                     std::min(panel_h, inout_panel.rows)));
+  cv::Mat shade(roi.size(), roi.type(), cv::Scalar(18, 18, 18));
+  cv::addWeighted(shade, 0.62, roi, 0.38, 0.0, roi);
+
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    const int y = kPadY + static_cast<int>(i) * kLineH + 4;
+    cv::putText(inout_panel, rows[i][0], {kPadX, y}, kFont, kScale, kLabelInk, 1, cv::LINE_AA);
+    cv::putText(inout_panel, rows[i][1], {kPadX + kLabelW, y}, kFont, kScale,
+                value_colors[i], 1, cv::LINE_AA);
+  }
+}
+
+// @brief: This function streams one clip and renders each step as a camera
+// panel (rainbow prediction ribbon + ground-truth line + deployment HUD) beside
+// the BEV, written as an mp4 (PNG directory when no video encoder is built in)
 static int Visualize() {
   auto planner_ptr = planner::CreatePlanner(FLAGS_engine_file);
   auto window_ptr  = preprocess::CreateFrameWindow();
@@ -331,66 +368,94 @@ static int Visualize() {
   fs::path        png_dir;
   timer::Timer    timer;
 
+  constexpr int    kPanelHeight = 560;
+  const cv::Scalar kGood{120, 210, 90};  // green: within tolerance / fast
+  const cv::Scalar kInk{225, 225, 225};  // near-white value text
+  const cv::Scalar kSeparator{45, 47, 47};
+
   StreamClip(clip_dir, *planner_ptr, *window_ptr, timer,
              [&](std::size_t k, const nlohmann::json &step,
                  const std::array<float, planner::kStatusDim> &status,
                  const common::Trajectory &pred, const cv::Mat &camera_in) {
                const std::size_t row_numel = num_waypoints * 3;
 
+               // --- camera panel: rainbow prediction ribbon + white GT line ---
                cv::Mat camera = camera_in.clone();
-               bev_ptr->Clear();
-
-               if (gt_usable) {
-                 const auto gt_k = RowToTrajectory(gt.data.data() + k * row_numel, num_waypoints);
-                 if (projector_ptr) {
-                   projector_ptr->DrawTrajectory(camera, gt_k, visualizer::color::kGroundTruth, 1, false);
-                 }
-                 bev_ptr->DrawTrajectory(gt_k, visualizer::color::kGroundTruth, 1);
-                 bev_ptr->AddLegend("ground truth", visualizer::color::kGroundTruth);
-               }
-               if (ref_usable) {
-                 const auto ref_k = RowToTrajectory(ref.data.data() + k * row_numel, num_waypoints);
-                 if (projector_ptr) {
-                   projector_ptr->DrawTrajectory(camera, ref_k, visualizer::color::kReference, 1);
-                 }
-                 bev_ptr->DrawTrajectory(ref_k, visualizer::color::kReference, 2, true);
-                 bev_ptr->AddLegend("PyTorch ref", visualizer::color::kReference);
-               }
                if (projector_ptr) {
-                 projector_ptr->DrawTrajectory(camera, pred, visualizer::color::kPrediction, 2);
+                 projector_ptr->DrawRibbon(camera, pred, 0.9, 0.5);
+                 if (gt_usable) {
+                   const auto gt_k = RowToTrajectory(gt.data.data() + k * row_numel, num_waypoints);
+                   projector_ptr->DrawTrajectory(camera, gt_k, cv::Scalar(255, 255, 255), 1, true);
+                 }
                }
-               bev_ptr->DrawTrajectory(pred, visualizer::color::kPrediction, 2);
+               cv::Mat cam_panel;
+               cv::resize(camera, cam_panel, cv::Size(kPanelHeight * camera.cols / camera.rows, kPanelHeight),
+                          0, 0, cv::INTER_LINEAR);
+
+               // --- BEV panel: gradient prediction + GT + subgoal + velocity ---
+               bev_ptr->Clear();
+               if (gt_usable) {
+                 bev_ptr->DrawTrajectory(RowToTrajectory(gt.data.data() + k * row_numel, num_waypoints),
+                                         visualizer::color::kGroundTruth, 1);
+               }
+               bev_ptr->DrawTrajectoryHorizon(pred, 2);
                bev_ptr->DrawSubgoal(status[0] * 10.f, status[1] * 10.f);
                bev_ptr->DrawVelocity(status[2], status[3]);
-               bev_ptr->AddLegend("TRT fp16 pred", visualizer::color::kPrediction);
+               // the plan itself is drawn as a green(now)->red(+4s) gradient;
+               // the legend swatch takes the near/now end
+               bev_ptr->AddLegend("plan now->+4s", visualizer::HorizonColor(0.0));
+               bev_ptr->AddLegend("ground truth", visualizer::color::kGroundTruth);
                bev_ptr->AddLegend("subgoal 50m", visualizer::color::kSubgoal);
-
-               // Compose one column: camera resized to the BEV width, a HUD
-               // strip, then the BEV canvas
                const cv::Mat &bev = bev_ptr->Image();
-               cv::Mat        camera_resized;
-               cv::resize(camera, camera_resized,
-                          cv::Size(bev.cols, camera.rows * bev.cols / camera.cols),
+               cv::Mat        bev_panel;
+               cv::resize(bev, bev_panel,
+                          cv::Size(kPanelHeight * bev.cols / bev.rows, kPanelHeight),
                           0, 0, cv::INTER_AREA);
 
+               // --- deployment HUD on the camera panel ---
+               const double engine_ms = timer.Last("enqueue");
+               const double pre_ms    = timer.Last("preprocess");
+               const double plan_ms   = engine_ms + pre_ms;
+               const double med_ms    = timer.Percentile("enqueue", 50) +
+                                     timer.Percentile("preprocess", 50);
                const float speed = std::hypot(status[2], status[3]);
                const float wp_4s = std::hypot(pred.back().x, pred.back().y);
-               std::string hud   = cv::format(
-                   "%3zu/%d %s  v %4.1f  wp4s %5.2fm", k,
-                   sequence["n_steps"].get<int>() - 1,
-                   step["phase"].get<std::string>().c_str(), speed, wp_4s);
-               if (ref_usable) {
-                 hud += cv::format("  err %.3f",
-                                   MaxXyError(pred, ref.data.data() + k * row_numel));
-               }
 
-               const int kHudHeight = 26;
-               cv::Mat   frame(camera_resized.rows + kHudHeight + bev.rows, bev.cols,
-                               CV_8UC3, cv::Scalar(25, 26, 26));
-               camera_resized.copyTo(frame(cv::Rect(0, 0, bev.cols, camera_resized.rows)));
-               cv::putText(frame, hud, {8, camera_resized.rows + 18},
-                           cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(183, 194, 195), 1, cv::LINE_AA);
-               bev.copyTo(frame(cv::Rect(0, camera_resized.rows + kHudHeight, bev.cols, bev.rows)));
+               std::vector<std::array<std::string, 2>> rows;
+               std::vector<cv::Scalar>                 cols;
+               rows.push_back({"LatentDrive",
+                               cv::format("TRT fp16  %s  %zu/%d  %s", FLAGS_clip.c_str(), k,
+                                          sequence["n_steps"].get<int>() - 1,
+                                          step["phase"].get<std::string>().c_str())});
+               cols.push_back(kInk);
+               rows.push_back({"speed",
+                               cv::format("%.1f ms/plan  %.0f Hz  (engine %.1f + pre %.1f)",
+                                          plan_ms, 1000.0 / std::max(med_ms, 1e-3), engine_ms, pre_ms)});
+               cols.push_back(kGood);
+               if (ref_usable) {
+                 const double err = MaxXyError(pred, ref.data.data() + k * row_numel);
+                 rows.push_back({"accuracy", cv::format("%.3f m max vs PyTorch fp32", err)});
+                 cols.push_back(err <= 0.10 ? kGood : cv::Scalar(60, 120, 235));
+               } else {
+                 rows.push_back({"accuracy", "no fp32 reference for this clip"});
+                 cols.push_back(kInk);
+               }
+               std::string intent = cv::format("|4s| %.1f m", wp_4s);
+               if (gt_usable) {
+                 const float *gt_last = gt.data.data() + k * row_numel + (num_waypoints - 1) * 3;
+                 intent += cv::format(" (GT %.1f)", std::hypot(gt_last[0], gt_last[1]));
+               }
+               intent += cv::format("  v %.1f m/s", speed);
+               rows.push_back({"intent", intent});
+               cols.push_back(kInk);
+               DrawHud(cam_panel, rows, cols);
+
+               // --- compose: camera | separator | BEV ---
+               cv::Mat frame(kPanelHeight, cam_panel.cols + 2 + bev_panel.cols, CV_8UC3,
+                             kSeparator);
+               cam_panel.copyTo(frame(cv::Rect(0, 0, cam_panel.cols, kPanelHeight)));
+               bev_panel.copyTo(
+                   frame(cv::Rect(cam_panel.cols + 2, 0, bev_panel.cols, kPanelHeight)));
 
                if (k == 0) {
                  writer.open(out_video, cv::VideoWriter::fourcc('m', 'p', '4', 'v'),

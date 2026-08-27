@@ -1,7 +1,10 @@
 #include "camera_projector.hpp"
 
+#include <cmath>
 #include <opencv2/imgproc.hpp>
 #include <vector>
+
+#include "color_map.hpp"
 
 namespace visualizer {
 
@@ -44,6 +47,47 @@ class CameraProjectorImpl : public CameraProjector {
         }
       }
     }
+  }
+
+  void DrawRibbon(cv::Mat &inout_image, const common::Trajectory &in_traj,
+                  double in_half_width_m, double in_alpha) const final {
+    if (in_traj.size() < 2) return;
+
+    // Path points in the ego ground plane, ego origin prepended
+    std::vector<cv::Point2d> path;
+    path.reserve(in_traj.size() + 1);
+    path.emplace_back(0.0, 0.0);
+    for (const common::Waypoint &wp : in_traj) path.emplace_back(wp.x, wp.y);
+
+    // The corridor is drawn onto a scratch layer and blended once, so the
+    // per-segment fills stay translucent without compounding where quads meet
+    cv::Mat overlay = inout_image.clone();
+    cv::Mat drawn(inout_image.size(), CV_8U, cv::Scalar(0));
+
+    for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+      // Lateral offset perpendicular to the local heading, in the ground plane
+      const cv::Point2d dir = path[i + 1] - path[i];
+      const double      len = std::hypot(dir.x, dir.y);
+      if (len < 1e-6) continue;
+      const cv::Point2d nrm(-dir.y / len * in_half_width_m, dir.x / len * in_half_width_m);
+
+      const auto l0 = Project(path[i].x + nrm.x, path[i].y + nrm.y, 0.0);
+      const auto r0 = Project(path[i].x - nrm.x, path[i].y - nrm.y, 0.0);
+      const auto l1 = Project(path[i + 1].x + nrm.x, path[i + 1].y + nrm.y, 0.0);
+      const auto r1 = Project(path[i + 1].x - nrm.x, path[i + 1].y - nrm.y, 0.0);
+      if (!l0 || !r0 || !l1 || !r1) continue;  // any corner behind the camera
+
+      const cv::Point quad[4] = {cv::Point(*l0), cv::Point(*r0), cv::Point(*r1), cv::Point(*l1)};
+      // Color at this segment's horizon fraction (green near -> red far)
+      const double frac = static_cast<double>(i) / (path.size() - 1);
+      cv::fillConvexPoly(overlay, quad, 4, HorizonColor(frac), cv::LINE_AA);
+      cv::fillConvexPoly(drawn, quad, 4, cv::Scalar(255), cv::LINE_AA);
+    }
+
+    // Blend only where the corridor was painted
+    cv::Mat blended;
+    cv::addWeighted(overlay, in_alpha, inout_image, 1.0 - in_alpha, 0.0, blended);
+    blended.copyTo(inout_image, drawn);
   }
 
  private:

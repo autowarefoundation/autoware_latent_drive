@@ -4,6 +4,8 @@
 #include <opencv2/imgproc.hpp>
 #include <vector>
 
+#include "color_map.hpp"
+
 namespace visualizer {
 
 // Chrome palette (BGR), matching the dark theme of the benchmark report
@@ -105,6 +107,18 @@ class BevVisualizerImpl : public BevVisualizer {
                                  wp.y + kTickLength * std::sin(wp.heading));
       cv::circle(canvas_, p, in_thickness + 1, in_color, cv::FILLED, cv::LINE_AA);
       cv::line(canvas_, p, tip, in_color, 1, cv::LINE_AA);
+    }
+  }
+
+  void DrawTrajectoryHorizon(const common::Trajectory &in_traj, int in_thickness) final {
+    cv::Point prev = ToPx(0.f, 0.f);
+    for (std::size_t i = 0; i < in_traj.size(); ++i) {
+      const cv::Point  p    = ToPx(in_traj[i].x, in_traj[i].y);
+      const double     frac = static_cast<double>(i) / (in_traj.size() - 1);
+      const cv::Scalar c    = HorizonColor(frac);
+      cv::line(canvas_, prev, p, c, in_thickness, cv::LINE_AA);
+      cv::circle(canvas_, p, in_thickness, c, cv::FILLED, cv::LINE_AA);
+      prev = p;
     }
   }
 

@@ -45,6 +45,11 @@ class BevVisualizer {
                               const cv::Scalar &in_color, int in_thickness = 2,
                               bool in_dashed = false) = 0;
 
+  // @brief: Prediction polyline colored along the horizon (green near -> red
+  // far), matching the camera ribbon so the two panels read as one plan
+  virtual void DrawTrajectoryHorizon(const common::Trajectory &in_traj,
+                                     int                       in_thickness = 2) = 0;
+
   // @brief: The route subgoal (physical metres, ego frame) as a diamond
   // marker, clamped into view with a distance label when outside the canvas
   virtual void DrawSubgoal(float in_x_m, float in_y_m,

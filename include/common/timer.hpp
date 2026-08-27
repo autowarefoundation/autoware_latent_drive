@@ -28,6 +28,10 @@ class Timer {
   // stored under `msg`. Returns 0 when the tag has no samples
   double Percentile(const std::string &msg, double percentile) const;
 
+  // @brief: This function is used to get the most recent sample [ms] stored
+  // under `msg`, for a live per-frame readout. Returns 0 when empty
+  double Last(const std::string &msg) const;
+
   int SampleCount(const std::string &msg) const;
 
   // @brief: This function is used to print median/p99/max for every tag
