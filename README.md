@@ -72,52 +72,48 @@ in a bird's-eye view with `DrawTrajectoryHorizon` (matching gradient), plus the
 subgoal marker and velocity arrow. Both draw on plain `cv::Mat`, so the ROS 2
 node can publish the same canvases as `sensor_msgs/Image`.
 
-## Build
+## Environment
 
-Dependencies: CUDA 12.x, TensorRT 10.x, OpenCV 4, gflags, nlohmann-json.
-The deployment container from the training repo has all of them:
-
-```bash
-cmake -B build     # -DTENSORRT_ROOT=... for tarball installs
-cmake --build build -j
-```
-
-## Build the engine from ONNX
-
-`build-engine` parses the ONNX export with nvonnxparser and builds through
-`IBuilder` (TensorRT 10 API). The fp16 build pins the planner-stage layers
-(`kFp32LayerPrefixes` in `planner_params.hpp`) to fp32 under
-`kOBEY_PRECISION_CONSTRAINTS` — the in-framework equivalent of the validated
-trtexec recipe; index/shape layers are skipped since they reject a float
-constraint:
+Build and run inside the **pilot-auto.xx1** deployment container, so everything
+links the same CUDA 12.8 / TensorRT 10.8 the vehicle runs. Setup, and the full
+build → engine → validate → visualize walkthrough, are in
+[`docker/README.md`](docker/README.md):
 
 ```bash
-./build/bin/latentdrive-trt --mode=build-engine \
-    --onnx_file=e2e-idx8-hist4-e3.onnx --engine_file=e2e-fp16-mixed.engine
-    # --prec=fp32 for the control engine; --pure_fp16 disables the pin (fails validation)
+./docker/build.sh                                 # pilot-auto-xx1:v0.53-cuda (once)
+DATA=/path/to/workspace ./docker/run.sh           # shell at /workspace, data at /data
 ```
 
-## Run against the hand-off package
+Dependencies (CUDA, TensorRT, OpenCV 4, gflags, nlohmann-json, CMake, g++) are
+all present in that image. A native build works too if they are installed:
+`cmake -B build && cmake --build build -j` (`-DTENSORRT_ROOT=...` for a tarball
+install).
 
-`run-package` replays the `workspace/` test package from the training repo —
-9 alignment samples, a preprocessing self-test, 2 streaming clips and the
-batch-1 latency benchmark — and writes the `.npy` outputs its `validate.py`
-scores:
+## Commands
+
+One binary, `build/bin/latentdrive-trt`, three modes:
 
 ```bash
-./build/bin/latentdrive-trt --mode=run-package \
-    --engine_file=e2e-fp16-mixed.engine --package_dir=/path/to/workspace
-(cd /path/to/workspace && python3 validate.py)     # expect 11/11
+# ONNX -> engine (fp16, planner stage pinned to fp32 via IBuilder;
+#   --prec=fp32 for the control engine, --pure_fp16 disables the pin)
+latentdrive-trt --mode=build-engine --onnx_file=E.onnx --engine_file=E.engine
+
+# validate + batch-1 benchmark against the hand-off package
+latentdrive-trt --mode=run-package --engine_file=E.engine --package_dir=/data \
+    [--ref_name=ref_output_fp32_wp10hz.npy]      # 40-wp model; default is the 8-wp refs
+
+# camera ribbon + BEV mp4
+latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
+    --clip=follow_lane --out_video=/workspace/viz/follow_lane.mp4
 ```
 
-`visualize` streams one clip and writes camera (with the waypoint overlay when
-`calibration.json` covers the scene) + HUD + BEV as an mp4:
-
-```bash
-./build/bin/latentdrive-trt --mode=visualize \
-    --engine_file=e2e-fp16-mixed.engine --package_dir=/path/to/workspace \
-    --clip=stop_to_launch --out_video=viz/stop_to_launch.mp4 --png_every=40
-```
+`run-package` writes the `.npy` outputs the package's `validate.py` scores
+(`python3 validate.py` → 11/11 for the 8-waypoint model). The engine build
+reproduces the validated trtexec recipe in the TensorRT C++ API: the planner
+stage (`kFp32LayerPrefixes` in `planner_params.hpp`) is held at fp32 under
+`kOBEY_PRECISION_CONSTRAINTS`, and index/shape layers are skipped since they
+reject a float constraint. The waypoint count (8 at 2 Hz, 40 at 10 Hz) is read
+from the engine at load, so the same binary serves both checkpoints.
 
 ## Roadmap
 
