@@ -44,6 +44,11 @@ DEFINE_bool(pure_fp16, false,
 // Input data flags
 DEFINE_string(package_dir, "", "Path to the hand-off test package (workspace/)");
 DEFINE_string(clip, "follow_lane", "Sequence clip name for visualize mode");
+DEFINE_string(clip_dir, "",
+              "visualize: use this clip directory directly (sequence.json / status.npy "
+              "/ frames / ref / gt), overriding <package_dir>/sequence/<clip>");
+DEFINE_string(gt_name, "gt_target.npy",
+              "visualize: file name of the ground-truth trajectory in the clip dir");
 DEFINE_string(calibration_file, "",
               "Path to calibration.json (default: <package_dir>/calibration.json)");
 
@@ -334,11 +339,17 @@ static int Visualize() {
   auto bev_ptr     = visualizer::CreateBevVisualizer();
   if (!planner_ptr || !window_ptr || !bev_ptr) return 1;
 
-  const fs::path clip_dir = fs::path(FLAGS_package_dir) / "sequence" / FLAGS_clip;
+  // --clip_dir points straight at a clip directory; otherwise fall back to the
+  // package layout <package_dir>/sequence/<clip>
+  const fs::path clip_dir = FLAGS_clip_dir.empty()
+                                ? (fs::path(FLAGS_package_dir) / "sequence" / FLAGS_clip)
+                                : fs::path(FLAGS_clip_dir);
   const auto     ref      = fs::exists(clip_dir / FLAGS_ref_name)
                                 ? utils::LoadNpy((clip_dir / FLAGS_ref_name).string())
                                 : utils::NpyArray{};
-  const auto     gt       = utils::LoadNpy((clip_dir / "gt_target.npy").string());
+  const auto     gt       = fs::exists(clip_dir / FLAGS_gt_name)
+                                ? utils::LoadNpy((clip_dir / FLAGS_gt_name).string())
+                                : utils::NpyArray{};
 
   // A reference/gt trajectory only overlays when its waypoint count matches
   // the engine's; the 8-waypoint package files stay useful for the 2 Hz
@@ -423,10 +434,11 @@ static int Visualize() {
 
                std::vector<std::array<std::string, 2>> rows;
                std::vector<cv::Scalar>                 cols;
+               // `phase` is optional -- the newer whole-scene exports drop it
                rows.push_back({"LatentDrive",
                                cv::format("TRT fp16  %s  %zu/%d  %s", FLAGS_clip.c_str(), k,
                                           sequence["n_steps"].get<int>() - 1,
-                                          step["phase"].get<std::string>().c_str())});
+                                          step.value("phase", std::string()).c_str())});
                cols.push_back(kInk);
                rows.push_back({"speed",
                                cv::format("%.1f ms/plan  %.0f Hz  (engine %.1f + pre %.1f)",
@@ -522,14 +534,17 @@ int main(int argc, char *argv[]) {
     return BuildEngine();
   }
 
-  if (FLAGS_package_dir.empty()) {
-    LOGE("--package_dir is required for --mode=%s", FLAGS_mode.c_str());
-    return 2;
-  }
-
   if (FLAGS_mode == "run-package") {
+    if (FLAGS_package_dir.empty()) {
+      LOGE("--package_dir is required for --mode=run-package");
+      return 2;
+    }
     return RunPackage();
   } else if (FLAGS_mode == "visualize") {
+    if (FLAGS_package_dir.empty() && FLAGS_clip_dir.empty()) {
+      LOGE("--mode=visualize needs --package_dir or --clip_dir");
+      return 2;
+    }
     return Visualize();
   }
 
