@@ -13,9 +13,14 @@
 #   REPO    host dir mounted at /workspace (default: this repository)
 #   DATA    host dir mounted at /data (the hand-off package); required for the
 #           build-engine / run-package / visualize commands
+#   BAG     rosbag dir mounted at /bag (for the ROS 2 replay node)
 #   GPUS    value for --gpus (default all)
 #   NAME    container name; when set the container is kept after exit and a
 #           second invocation execs into the running one. Unset means --rm.
+#   NO_X11=1  skip X11 forwarding (no GUI windows like rqt_image_view)
+#
+# For live GUI windows (rqt_image_view) run `xhost +local:docker` on the host
+# once, then start with X11 forwarded (the default here).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,15 +40,37 @@ fi
 
 args=(
     --gpus "$GPUS"
+    # ROS 2 nodes + rqt talk over localhost/shared-memory DDS; host net + shm
+    # keep discovery and large image transport happy
+    --network host
+    --ipc host
+    --shm-size 8g
     -v "$REPO:/workspace"
     -w /workspace
 )
 
 if [ -n "${DATA:-}" ]; then
     args+=(-v "$DATA:/data")
-else
-    echo "note: DATA is unset; the build-engine/run-package/visualize commands" >&2
-    echo "      need the hand-off package mounted, e.g. DATA=/path/to/workspace" >&2
+fi
+
+if [ -n "${BAG:-}" ]; then
+    args+=(-v "$BAG:/bag")
+fi
+
+# Only nag about mounts when nothing is mounted at all -- with BAG set this is
+# a ROS 2 replay run (data comes from the repo + /bag), so DATA isn't needed.
+if [ -z "${DATA:-}" ] && [ -z "${BAG:-}" ]; then
+    echo "note: neither DATA nor BAG is set. Mount the hand-off package with" >&2
+    echo "      DATA=/path/to/workspace (CLI) or a rosbag with BAG=/path (ROS 2)." >&2
+fi
+
+# X11 for GUI windows (rqt_image_view). Run `xhost +local:docker` once on the
+# host if the display is refused.
+if [ -z "${NO_X11:-}" ] && [ -n "${DISPLAY:-}" ]; then
+    args+=(-e "DISPLAY=$DISPLAY" -v /tmp/.X11-unix:/tmp/.X11-unix:ro)
+    if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+        args+=(-e XAUTHORITY=/tmp/.docker.xauth -v "$XAUTHORITY:/tmp/.docker.xauth:ro")
+    fi
 fi
 
 if [ -n "${NAME:-}" ]; then
