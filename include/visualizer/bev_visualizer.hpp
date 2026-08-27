@@ -10,7 +10,7 @@
 namespace visualizer {
 
 struct BevParams {
-  float range_fwd_m  = 45.f;  // metres of road ahead of the ego origin
+  float range_fwd_m  = 52.f;  // metres ahead; > the 50 m subgoal so it stays in view
   float range_back_m = 5.f;   // metres behind
   float range_lat_m  = 16.f;  // metres to each side
   int   px_per_m     = 12;
