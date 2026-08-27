@@ -153,6 +153,8 @@ src/cpp/
   latentdrive/  PlannerImpl (TensorRT), FrameWindowImpl (preprocessing)
   visualizer/   BevVisualizerImpl, CameraProjectorImpl
   main/         gflags mode dispatch (build-engine, run-package, visualize)
+docker/         pilot-auto.xx1 deployment container (Dockerfile, build/run)
+ros2/           ROS 2 open-loop rosbag replay package (latentdrive_ros)
 ```
 
 Every module is an interface class plus a `CreateX()` factory; the
