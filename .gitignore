@@ -9,3 +9,8 @@ compile_commands.json
 viz/
 *.mp4
 *.png
+ros2/build/
+ros2/install/
+ros2/log/
+__pycache__/
+*.pyc
