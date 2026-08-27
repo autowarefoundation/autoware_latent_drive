@@ -1,4 +1,6 @@
 build*/
+sample_data/
+models/
 *.engine
 *.onnx
 *.npy
