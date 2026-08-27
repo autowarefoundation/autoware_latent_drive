@@ -165,7 +165,12 @@ class LatentDriveNode : public rclcpp::Node {
     const cv::Mat frame = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
     if (frame.empty()) return;
     window_->Push(frame);
-    if (!window_->Ready() || !odom_) return;
+    if (!window_->Ready() || !odom_) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "warming up: window %d/16, odom=%s", window_->Size(),
+                           odom_ ? "ready" : "waiting");
+      return;
+    }
 
     // --- status ---
     const auto &q = odom_->pose.pose.orientation;
@@ -188,6 +193,10 @@ class LatentDriveNode : public rclcpp::Node {
 
     PublishPlan(plan, msg->header.stamp);
     PublishViz(CropResize(frame), plan, ego);
+
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "planning: v=%.1f m/s  |4s|=%.1f m", std::hypot(ego.vel_x, ego.vel_y),
+                         std::hypot(plan.back().x, plan.back().y));
   }
 
   void PublishPlan(const common::Trajectory &plan, const rclcpp::Time &stamp) {

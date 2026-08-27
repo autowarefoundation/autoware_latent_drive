@@ -9,7 +9,7 @@ The node publishes /latentdrive_node/viz (camera+BEV image) and
     ros2 run rqt_image_view rqt_image_view /latentdrive_node/viz
 """
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -37,14 +37,19 @@ def generate_launch_description():
                 "route_file": LaunchConfiguration("route"),
             }],
         ),
-        ExecuteProcess(
-            cmd=["ros2", "bag", "play", bag, "--rate", rate,
-                 "--topics",
-                 "/sensing/camera/camera1/image_raw/compressed",
-                 "/localization/kinematic_state",
-                 "/localization/acceleration"],
-            output="screen",
-        ),
+        # Delay the bag so the node has warmed up (engine load + 5 warmup
+        # inferences) and rqt has subscribed before playback starts -- otherwise
+        # the first frames are missed and the window stays blank.
+        TimerAction(period=5.0, actions=[
+            ExecuteProcess(
+                cmd=["ros2", "bag", "play", bag, "--rate", rate,
+                     "--topics",
+                     "/sensing/camera/camera1/image_raw/compressed",
+                     "/localization/kinematic_state",
+                     "/localization/acceleration"],
+                output="screen",
+            ),
+        ]),
         # live window (needs X11 forwarding + `xhost +local:docker` on the host)
         Node(
             package="rqt_image_view",
