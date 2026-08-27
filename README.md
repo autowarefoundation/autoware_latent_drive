@@ -5,43 +5,99 @@ Standalone TensorRT C++ inference framework for the LatentDrive e2e planner
 layer the ROS 2 node will sit on: the library knows nothing about ROS, files
 or JSON — it takes camera frames and ego status, and returns a trajectory.
 
+## Environment
+
+Two ways to build and run — Docker (matches the vehicle exactly) or a native
+build on the host. Both need the same stack:
+
+- **CUDA 12.8** and **TensorRT 10.8.0.43** — match the version the engine will
+  run against; a serialized engine is not portable across TensorRT versions, so
+  build and run must use the same one.
+- **cuDNN — not required.** TensorRT 10 does not depend on it and the planner
+  uses no cuDNN path, so there is nothing to install.
+- **OpenCV 4**, **gflags**, **nlohmann-json**, **CMake ≥ 3.22**, **g++** (C++17).
+
+### Option A — Docker (recommended)
+
+Build and run inside the **pilot-auto.xx1** deployment container, so everything
+links the same CUDA 12.8 / TensorRT 10.8 the vehicle runs. Setup and the full
+build → engine → validate → visualize walkthrough are in
+[`docker/README.md`](docker/README.md):
+
+```bash
+./docker/build.sh                                 # pilot-auto-xx1:v0.53-cuda (once)
+DATA=/path/to/workspace ./docker/run.sh           # shell at /workspace, data at /data
+```
+
+Every dependency is already in that image; jump straight to `cmake` inside the
+shell it opens.
+
+### Option B — Native (no Docker)
+
+Distro packages cover everything except the NVIDIA stack:
+
+```bash
+sudo apt install libopencv-dev libgflags-dev nlohmann-json3-dev cmake g++
+```
+
+Install **CUDA 12.8** and **TensorRT 10.8.0.43** from NVIDIA (apt repo or
+tarball) — the same versions the deployment container pins, so an engine built
+here loads on the vehicle; cuDNN is not needed. Then build, pointing CMake at
+TensorRT if it is not on the default search path:
+
+```bash
+cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # omit if installed system-wide
+cmake --build build -j
+```
+
+The framework has no ROS or Docker dependency, so this is also how it builds on
+the target vehicle.
+
+## Commands
+
+One binary, `build/bin/latentdrive-trt`, three modes. Paths below use the
+Docker mount points (`/data` = the hand-off package, `/workspace` = this repo);
+natively, just pass the real host paths.
+
+```bash
+# ONNX -> engine (fp16, planner stage pinned to fp32 via IBuilder;
+#   --prec=fp32 for the control engine, --pure_fp16 disables the pin)
+latentdrive-trt --mode=build-engine --onnx_file=E.onnx --engine_file=E.engine
+
+# validate + batch-1 benchmark against the hand-off package
+latentdrive-trt --mode=run-package --engine_file=E.engine --package_dir=/data \
+    [--ref_name=ref_output_fp32_wp10hz.npy]      # 40-wp model; default is the 8-wp refs
+
+# camera ribbon + BEV mp4
+latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
+    --clip=follow_lane --out_video=viz/follow_lane.mp4
+```
+
+`run-package` writes the `.npy` outputs the package's `validate.py` scores
+(`python3 validate.py` → 11/11 for the 8-waypoint model). The engine build
+reproduces the validated trtexec recipe in the TensorRT C++ API: the planner
+stage (`kFp32LayerPrefixes` in `planner_params.hpp`) is held at fp32 under
+`kOBEY_PRECISION_CONSTRAINTS`, and index/shape layers are skipped since they
+reject a float constraint. The waypoint count (8 at 2 Hz, 40 at 10 Hz) is read
+from the engine at load, so the same binary serves both checkpoints.
+
 ## Model contract
 
 | tensor | shape | meaning |
 |---|---|---|
 | `video` | `[1,3,4,256,512]` | 4 front-camera frames, oldest→newest, 0.5 s apart, RGB, ImageNet-normalized |
 | `status` | `[1,6]` | `[subgoal_x/10, subgoal_y/10, vel_x, vel_y, acc_x, acc_y]`, ego frame |
-| `traj` | `[1,8,3]` | 8 waypoints at t+0.5…4.0 s: `(x fwd [m], y left [m], heading [rad])` |
+| `traj` | `[1,N,3]` | N waypoints (8 at 2 Hz, 40 at 10 Hz) over t+0.5…4.0 s: `(x fwd [m], y left [m], heading [rad])` |
 
 The ONNX comes from `deployment/export_onnx.py` in the training repo
-(`kalfazed/JEPA-World-model`, opset 17); the engine builds either there via
+(`kalfazed/LatentDrive`, opset 17); the engine builds either there via
 `trtexec` or here via `--mode=build-engine` (TensorRT C++ builder API). Both
 apply the same precision recipe — fp16 with the planner stage pinned to fp32 —
 and produce numerically identical results: validated 11/11 against the
 PyTorch reference, ~4.7 ms engine call / ~5.8 ms end-to-end per step on an
 RTX 4090 — 6% of the 10 Hz budget.
 
-## Layout
-
-```
-include/
-  common/       logger, timer, cuda RAII helpers, trajectory types
-  latentdrive/  planner interface + params (the model contract)
-  visualizer/   BEV renderer and camera projector interfaces
-  utils/        npy reader/writer
-src/cpp/
-  common/       logger, timer
-  latentdrive/  PlannerImpl (TensorRT), FrameWindowImpl (preprocessing)
-  visualizer/   BevVisualizerImpl, CameraProjectorImpl
-  main/         gflags mode dispatch (run-package, visualize)
-```
-
-Every module is an interface class plus a `CreateX()` factory; the
-implementation classes stay inside the .cpp files, so consumers see neither
-TensorRT nor CUDA types. GPU resources are held by `common::cuda` unique
-pointers (RAII), errors go through the `logger` macros.
-
-## Interface
+## ROS 2 interface
 
 ```cpp
 #include "frame_window.hpp"
@@ -72,76 +128,25 @@ in a bird's-eye view with `DrawTrajectoryHorizon` (matching gradient), plus the
 subgoal marker and velocity arrow. Both draw on plain `cv::Mat`, so the ROS 2
 node can publish the same canvases as `sensor_msgs/Image`.
 
-## Environment
+## Codebase layout
 
-Two ways to build and run. The dependencies are the same either way:
-CUDA 12.x, TensorRT 10.x, OpenCV 4, gflags, nlohmann-json, CMake ≥ 3.22, g++
-with C++17.
-
-### Option A — Docker (recommended)
-
-Build and run inside the **pilot-auto.xx1** deployment container, so everything
-links the same CUDA 12.8 / TensorRT 10.8 the vehicle runs. Setup and the full
-build → engine → validate → visualize walkthrough are in
-[`docker/README.md`](docker/README.md):
-
-```bash
-./docker/build.sh                                 # pilot-auto-xx1:v0.53-cuda (once)
-DATA=/path/to/workspace ./docker/run.sh           # shell at /workspace, data at /data
+```
+include/
+  common/       logger, timer, cuda RAII helpers, trajectory types
+  latentdrive/  planner interface + params (the model contract)
+  visualizer/   BEV renderer and camera projector interfaces
+  utils/        npy reader/writer
+src/cpp/
+  common/       logger, timer
+  latentdrive/  PlannerImpl (TensorRT), FrameWindowImpl (preprocessing)
+  visualizer/   BevVisualizerImpl, CameraProjectorImpl
+  main/         gflags mode dispatch (build-engine, run-package, visualize)
 ```
 
-Every dependency is already in that image; jump straight to `cmake` inside the
-shell it opens.
-
-### Option B — Native (no Docker)
-
-Install the dependencies on the host, then build directly. On Ubuntu the
-distro packages cover everything except the NVIDIA stack:
-
-```bash
-sudo apt install libopencv-dev libgflags-dev nlohmann-json3-dev cmake g++
-```
-
-CUDA and TensorRT come from NVIDIA (apt repo or tarball). Point CMake at the
-TensorRT location if it is not on the default search path:
-
-```bash
-cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # omit if installed system-wide
-cmake --build build -j
-```
-
-This is the right option on the target vehicle, or on any host that already has
-a matching CUDA/TensorRT — the framework itself has no ROS or Docker dependency.
-Just make sure the TensorRT major version matches the one the engine was built
-with (10.x), since serialized engines are not portable across versions.
-
-## Commands
-
-One binary, `build/bin/latentdrive-trt`, three modes. Paths below use the
-Docker mount points (`/data` = the hand-off package, `/workspace` = this repo);
-natively, just pass the real host paths.
-
-```bash
-# ONNX -> engine (fp16, planner stage pinned to fp32 via IBuilder;
-#   --prec=fp32 for the control engine, --pure_fp16 disables the pin)
-latentdrive-trt --mode=build-engine --onnx_file=E.onnx --engine_file=E.engine
-
-# validate + batch-1 benchmark against the hand-off package
-latentdrive-trt --mode=run-package --engine_file=E.engine --package_dir=/data \
-    [--ref_name=ref_output_fp32_wp10hz.npy]      # 40-wp model; default is the 8-wp refs
-
-# camera ribbon + BEV mp4
-latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
-    --clip=follow_lane --out_video=viz/follow_lane.mp4
-```
-
-`run-package` writes the `.npy` outputs the package's `validate.py` scores
-(`python3 validate.py` → 11/11 for the 8-waypoint model). The engine build
-reproduces the validated trtexec recipe in the TensorRT C++ API: the planner
-stage (`kFp32LayerPrefixes` in `planner_params.hpp`) is held at fp32 under
-`kOBEY_PRECISION_CONSTRAINTS`, and index/shape layers are skipped since they
-reject a float constraint. The waypoint count (8 at 2 Hz, 40 at 10 Hz) is read
-from the engine at load, so the same binary serves both checkpoints.
+Every module is an interface class plus a `CreateX()` factory; the
+implementation classes stay inside the .cpp files, so consumers see neither
+TensorRT nor CUDA types. GPU resources are held by `common::cuda` unique
+pointers (RAII), errors go through the `logger` macros.
 
 ## Roadmap
 
