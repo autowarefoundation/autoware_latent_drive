@@ -46,7 +46,8 @@ class BevVisualizer {
                               bool in_dashed = false) = 0;
 
   // @brief: Prediction polyline colored along the horizon (green near -> red
-  // far), matching the camera ribbon so the two panels read as one plan
+  // far), matching the camera ribbon so the two panels read as one plan, with
+  // a dot on the whole-second poses
   virtual void DrawTrajectoryHorizon(const common::Trajectory &in_traj,
                                      int                       in_thickness = 2) = 0;
 

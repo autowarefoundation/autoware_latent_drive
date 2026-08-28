@@ -23,6 +23,7 @@
 #include "planner.hpp"
 #include "timer.hpp"
 #include "trajectory.hpp"
+#include "trajectory_smoother.hpp"
 
 using namespace std;
 
@@ -61,6 +62,10 @@ DEFINE_string(ref_name, "ref_output_fp32.npy",
 DEFINE_string(out_video, "", "Output video path (default: viz_<clip>.mp4)");
 DEFINE_int32(fps, 10, "Frames per second of the output video");
 DEFINE_int32(png_every, 0, "Also dump a standalone PNG still every N steps (0 = off)");
+DEFINE_double(smooth_alpha, 0.35,
+              "visualize: weight of the fresh plan when smoothing the DRAWN "
+              "trajectory across steps (1.0 = draw the raw plan). Display "
+              "only; the accuracy readout always uses the raw plan");
 DEFINE_bool(skip_benchmark, false, "Skip the latency benchmark in run-package mode");
 
 // @brief: This function is used to compute the largest per-waypoint xy
@@ -339,6 +344,10 @@ static int Visualize() {
   auto bev_ptr     = visualizer::CreateBevVisualizer();
   if (!planner_ptr || !window_ptr || !bev_ptr) return 1;
 
+  // Display-only: the plan the panels draw is the filtered one, everything
+  // reported in the HUD stays on the raw engine output
+  auto smoother_ptr = visualizer::CreateTrajectorySmoother({FLAGS_smooth_alpha});
+
   // --clip_dir points straight at a clip directory; otherwise fall back to the
   // package layout <package_dir>/sequence/<clip>
   const fs::path clip_dir = FLAGS_clip_dir.empty()
@@ -378,6 +387,8 @@ static int Visualize() {
   bool            use_video = true;
   fs::path        png_dir;
   timer::Timer    timer;
+  double          prev_t_rel_s  = 0.0;
+  const double    step_period_s = 1.0 / std::max(sequence.value("fps", FLAGS_fps), 1);
 
   constexpr int    kPanelHeight = 560;
   const cv::Scalar kGood{120, 210, 90};  // green: within tolerance / fast
@@ -390,10 +401,19 @@ static int Visualize() {
                  const common::Trajectory &pred, const cv::Mat &camera_in) {
                const std::size_t row_numel = num_waypoints * 3;
 
+               // Step period straight from the clip; the smoother needs it to
+               // know how far to carry the previous plan forward. Older clips
+               // without per-step stamps fall back to the sequence rate
+               const double t_rel_s = step.value("t_rel_s", 0.0);
+               const double dt_s =
+                   (k > 0 && t_rel_s > prev_t_rel_s) ? (t_rel_s - prev_t_rel_s) : step_period_s;
+               prev_t_rel_s                  = t_rel_s;
+               const common::Trajectory shown = smoother_ptr->Update(pred, dt_s);
+
                // --- camera panel: rainbow prediction ribbon + white GT line ---
                cv::Mat camera = camera_in.clone();
                if (projector_ptr) {
-                 projector_ptr->DrawRibbon(camera, pred, 0.9, 0.5);
+                 projector_ptr->DrawRibbon(camera, shown, 0.9, 0.5);
                  if (gt_usable) {
                    const auto gt_k = RowToTrajectory(gt.data.data() + k * row_numel, num_waypoints);
                    projector_ptr->DrawTrajectory(camera, gt_k, cv::Scalar(255, 255, 255), 1, true);
@@ -409,7 +429,7 @@ static int Visualize() {
                  bev_ptr->DrawTrajectory(RowToTrajectory(gt.data.data() + k * row_numel, num_waypoints),
                                          visualizer::color::kGroundTruth, 1);
                }
-               bev_ptr->DrawTrajectoryHorizon(pred, 2);
+               bev_ptr->DrawTrajectoryHorizon(shown, 2);
                bev_ptr->DrawSubgoal(status[0] * 10.f, status[1] * 10.f);
                bev_ptr->DrawVelocity(status[2], status[3]);
                // the plan itself is drawn as a green(now)->red(+4s) gradient;

@@ -82,7 +82,8 @@ latentdrive-trt --mode=run-package --engine_file=E.engine --package_dir=/data \
 
 # camera ribbon + BEV mp4
 latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
-    --clip=follow_lane --out_video=viz/follow_lane.mp4
+    --clip=follow_lane --out_video=viz/follow_lane.mp4 \
+    [--smooth_alpha=0.35]                        # temporal smoothing of the DRAWN plan
 ```
 
 `run-package` writes the `.npy` outputs the package's `validate.py` scores
@@ -90,6 +91,13 @@ latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
 (8 at 2 Hz, 40 at 10 Hz) is read from the engine at load, so the same binary
 serves both checkpoints. The fp16 build's fp32-pin recipe lives in
 `engine_builder.cpp`.
+
+`visualize` draws a temporally smoothed plan: consecutive frames disagree by
+about a metre on how far the plan reaches, which reads as a tail that pulses
+in and out. `--smooth_alpha` is the weight of the fresh plan in that blend
+(`1.0` draws the raw output; lower is smoother and laggier). It is display
+only -- the accuracy readout and every `.npy` this binary writes stay on the
+raw engine output.
 
 ## Model contract
 
