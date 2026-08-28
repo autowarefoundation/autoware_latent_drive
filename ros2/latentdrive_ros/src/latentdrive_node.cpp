@@ -10,9 +10,13 @@
 // to parse /planning/trajectory. For open-loop replay the whole run is known,
 // so "50 m of arc length ahead on the driven path" is a faithful route target.
 #include <cmath>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <opencv2/imgcodecs.hpp>
@@ -26,6 +30,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/header.hpp>
 
 #include "bev_visualizer.hpp"
 #include "camera_projector.hpp"
@@ -75,6 +80,7 @@ class LatentDriveNode : public rclcpp::Node {
     const auto scene_match = declare_parameter<std::string>("scene_match", "prd_jt");
     subgoal_ahead_m_ = declare_parameter<double>("subgoal_ahead_m", 50.0);
     const auto smooth_alpha = declare_parameter<double>("smooth_alpha", 0.35);
+    viz_jpeg_quality_ = static_cast<int>(declare_parameter<int64_t>("viz_jpeg_quality", 80));
     const auto camera_topic = declare_parameter<std::string>(
         "camera_topic", "/sensing/camera/camera1/image_raw/compressed");
     const auto odom_topic = declare_parameter<std::string>(
@@ -114,9 +120,27 @@ class LatentDriveNode : public rclcpp::Node {
         accel_topic, sensor_qos,
         [this](geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr m) { accel_ = m; });
 
-    pub_viz_ = create_publisher<sensor_msgs::msg::Image>("~/viz", 1);
+    // Sensor QoS on the viz topics: best-effort, keep-last. A live overlay must
+    // never apply back-pressure -- with the default reliable, depth-1 profile a
+    // viewer that falls behind blocks the publisher, and the stall reaches the
+    // image callback as dropped camera frames (measured: 5.7 Hz with a viewer
+    // attached and four "stamp jumped" resets over a 60 s bag)
+    pub_viz_ = create_publisher<sensor_msgs::msg::Image>("~/viz", sensor_qos);
+    pub_viz_jpeg_ =
+        create_publisher<sensor_msgs::msg::CompressedImage>("~/viz/compressed", sensor_qos);
     pub_plan_ = create_publisher<nav_msgs::msg::Path>("~/plan", 1);
+
+    viz_thread_ = std::thread(&LatentDriveNode::VizLoop, this);
     RCLCPP_INFO(get_logger(), "latentdrive_node ready (%d waypoints)", planner_->NumWaypoints());
+  }
+
+  ~LatentDriveNode() override {
+    {
+      std::lock_guard<std::mutex> lock(viz_mutex_);
+      viz_stop_ = true;
+    }
+    viz_cv_.notify_one();
+    if (viz_thread_.joinable()) viz_thread_.join();
   }
 
  private:
@@ -199,7 +223,19 @@ class LatentDriveNode : public rclcpp::Node {
 
     const common::Trajectory &shown = Smoothed(plan, msg->header.stamp);
     PublishPlan(plan, msg->header.stamp);
-    PublishViz(CropResize(frame), shown, ego);
+
+    // Drawing and encoding cost more than the inference does, and doing them
+    // here used to block this callback long enough to drop camera frames --
+    // which is not just a stutter, it puts the wrong spacing into the 4-frame
+    // history the model reads. Hand the work to the viz thread instead. The
+    // mailbox holds one job: if drawing falls behind, the pending frame is
+    // replaced rather than queued, so the overlay stays live and the inference
+    // loop never waits. `frame` is a cv::Mat, so this shares rather than copies
+    {
+      std::lock_guard<std::mutex> lock(viz_mutex_);
+      viz_job_ = VizJob{frame, shown, ego};
+    }
+    viz_cv_.notify_one();
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                          "planning: v=%.1f m/s  |4s|=%.1f m", std::hypot(ego.vel_x, ego.vel_y),
@@ -241,6 +277,24 @@ class LatentDriveNode : public rclcpp::Node {
     pub_plan_->publish(path);
   }
 
+  // @brief: the viz thread. Sleeps until the image callback leaves a job, draws
+  // it, and goes back to sleep. Nothing here is touched by the inference
+  // callback -- `bev_` is drawn on by this thread alone, `projector_` is
+  // read-only after construction
+  void VizLoop() {
+    while (true) {
+      VizJob job;
+      {
+        std::unique_lock<std::mutex> lock(viz_mutex_);
+        viz_cv_.wait(lock, [this] { return viz_stop_ || viz_job_.has_value(); });
+        if (viz_stop_) return;
+        job = std::move(*viz_job_);
+        viz_job_.reset();
+      }
+      PublishViz(CropResize(job.frame), job.plan, job.ego);
+    }
+  }
+
   void PublishViz(cv::Mat camera, const common::Trajectory &plan, const common::EgoStatus &ego) {
     if (projector_) projector_->DrawRibbon(camera, plan, 0.9, 0.5);
 
@@ -268,15 +322,30 @@ class LatentDriveNode : public rclcpp::Node {
     cam_panel.copyTo(frame(cv::Rect(0, 0, cam_panel.cols, H)));
     bev_panel.copyTo(frame(cv::Rect(cam_panel.cols + 2, 0, bev_panel.cols, H)));
 
-    auto out = std::make_shared<sensor_msgs::msg::Image>();
-    out->header.stamp = now();
-    out->header.frame_id = "base_link";
-    out->height = frame.rows;
-    out->width = frame.cols;
-    out->encoding = "bgr8";
-    out->step = frame.cols * 3;
-    out->data.assign(frame.data, frame.data + frame.total() * 3);
-    pub_viz_->publish(*out);
+    std_msgs::msg::Header header;
+    header.stamp = now();
+    header.frame_id = "base_link";
+
+    // JPEG by default: the raw panel is 2.4 MB, which DDS delivers at about
+    // 4 Hz on this machine, and the encoded one is nearer 150 kB
+    sensor_msgs::msg::CompressedImage jpeg;
+    jpeg.header = header;
+    jpeg.format = "jpeg";
+    cv::imencode(".jpg", frame, jpeg.data, {cv::IMWRITE_JPEG_QUALITY, viz_jpeg_quality_});
+    pub_viz_jpeg_->publish(jpeg);
+
+    // The raw topic is kept for anything that cannot read the compressed one,
+    // but only paid for while something is actually subscribed to it
+    if (pub_viz_->get_subscription_count() > 0) {
+      sensor_msgs::msg::Image out;
+      out.header = header;
+      out.height = frame.rows;
+      out.width = frame.cols;
+      out.encoding = "bgr8";
+      out.step = frame.cols * 3;
+      out.data.assign(frame.data, frame.data + frame.total() * 3);
+      pub_viz_->publish(out);
+    }
   }
 
   std::shared_ptr<model::planner::Planner> planner_;
@@ -303,7 +372,21 @@ class LatentDriveNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_img_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<geometry_msgs::msg::AccelWithCovarianceStamped>::SharedPtr sub_accel_;
+  // One in-flight drawing job, latest wins
+  struct VizJob {
+    cv::Mat frame;  // the decoded camera frame, full resolution
+    common::Trajectory plan;
+    common::EgoStatus ego;
+  };
+  std::optional<VizJob> viz_job_;
+  std::mutex viz_mutex_;
+  std::condition_variable viz_cv_;
+  std::thread viz_thread_;
+  bool viz_stop_ = false;
+  int viz_jpeg_quality_ = 80;
+
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_viz_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_viz_jpeg_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_plan_;
 };
 
