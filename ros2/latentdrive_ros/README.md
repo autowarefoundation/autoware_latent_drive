@@ -18,10 +18,33 @@ It links the parent repo's inference/visualizer core (`Planner`, `FrameWindow`,
 | pub | `~/viz` | sensor_msgs/Image | the same panel raw; only published while something subscribes |
 | pub | `~/plan` | nav_msgs/Path | predicted trajectory (base_link) |
 
-Both `~/viz` topics are **best-effort, keep-last** (`SensorDataQoS`), like the
-camera topics they mirror — a viewer must never be able to slow the planner
-down. Subscribe with a matching best-effort profile (rqt_image_view has a QoS
-selector; `qos_profile_sensor_data` in rclpy).
+### Viewer QoS — read this before wondering why the window is blank
+
+Both `~/viz` topics are **best-effort, keep-last** by default (`SensorDataQoS`),
+like the camera topics they mirror: a viewer must never be able to slow the
+planner down. A **reliable subscriber will not match them and receives
+nothing** — the RMW says so on its own stderr:
+
+```
+New publisher discovered on topic '/latentdrive_node/viz', offering
+incompatible QoS. No messages will be received from it.
+Last incompatible policy: RELIABILITY
+```
+
+`rqt_image_view` in Jazzy has no QoS selector and image_transport defaults to
+reliable, so **`rqt_image_view` needs `-p viz_reliable:=true`** on the node.
+Measured on the 60 s bag, one viewer attached:
+
+| node `viz_reliable` | subscriber | viz rate | dropped-frame resets |
+|---|---|---|---|
+| `false` (default) | best-effort | 6.6-8.8 Hz | 0 |
+| `true` | best-effort | 8.1 Hz | 0 |
+| `true` | reliable (rqt_image_view) | 5.7 Hz | 3 |
+| `false` | reliable | **nothing** | — |
+
+So: anything that can subscribe best-effort (rclpy `qos_profile_sensor_data`,
+rviz2's Image display with Reliability set to Best Effort, `grab_viz.py`) gets
+the full camera rate. `rqt_image_view` costs a flag and some frames.
 
 Drawing, JPEG encoding and publishing run on their own thread, fed by a
 one-slot mailbox: if a viewer or the encoder falls behind, the pending frame is
@@ -81,8 +104,9 @@ ros2 bag play /path/to/bag_dir --topics \
     /sensing/camera/camera1/image_raw/compressed \
     /localization/kinematic_state /localization/acceleration
 
-# view it (pick the "compressed" transport, or pass the compressed topic)
-ros2 run rqt_image_view rqt_image_view /latentdrive_node/viz
+# view it -- rqt_image_view subscribes reliably, so start the node with
+# -p viz_reliable:=true (see "Viewer QoS" above)
+ros2 run rqt_image_view rqt_image_view /latentdrive_node/viz/compressed
 ```
 
 Or both together via the launch file:
@@ -144,7 +168,8 @@ SSH or when no display is available.
 `engine_file`, `calibration_file`, `route_file`, `camera_topic`, `odom_topic`,
 `accel_topic`, `scene_match` (calibration entry substring, default `prd_jt`),
 `subgoal_ahead_m` (default 50), `smooth_alpha` (default 0.35),
-`viz_jpeg_quality` (default 80).
+`viz_jpeg_quality` (default 80), `viz_reliable` (default false — see
+**Viewer QoS** above).
 
 `smooth_alpha` is the weight of the fresh plan when smoothing the trajectory
 `~/viz` **draws**; `1.0` draws the raw output, lower is smoother and laggier.
