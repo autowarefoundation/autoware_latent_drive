@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -21,6 +22,8 @@
 #include "logger.hpp"
 #include "npy.hpp"
 #include "planner.hpp"
+#include "route_map.hpp"
+#include "signal_strip.hpp"
 #include "timer.hpp"
 #include "trajectory.hpp"
 #include "trajectory_smoother.hpp"
@@ -62,6 +65,8 @@ DEFINE_string(ref_name, "ref_output_fp32.npy",
 DEFINE_string(out_video, "", "Output video path (default: viz_<clip>.mp4)");
 DEFINE_int32(fps, 10, "Frames per second of the output video");
 DEFINE_int32(png_every, 0, "Also dump a standalone PNG still every N steps (0 = off)");
+DEFINE_bool(timeline, true,
+            "visualize: draw the route + stability band under the camera/BEV row");
 DEFINE_double(smooth_alpha, 0.35,
               "visualize: weight of the fresh plan when smoothing the DRAWN "
               "trajectory across steps (1.0 = draw the raw plan). Display "
@@ -335,6 +340,63 @@ static void DrawHud(cv::Mat                                       &inout_panel,
   }
 }
 
+// @brief: This function is used to draw the route ledger: how far along the
+// clip's route the ego is and what is still owed to each milestone and to the
+// destination. `in_subgoal_m` is the straight-line distance to the subgoal the
+// model is actually being fed this step
+static void DrawRouteLedger(cv::Mat &inout_panel, const visualizer::RouteMap &in_route,
+                            std::size_t in_step, double in_subgoal_m) {
+  constexpr int    kFont  = cv::FONT_HERSHEY_SIMPLEX;
+  const cv::Scalar kInk   = {225, 225, 225};
+  const cv::Scalar kMuted = {120, 128, 130};
+  const cv::Scalar kGoal  = {120, 210, 90};
+  const cv::Scalar kSub   = {52, 104, 235};
+
+  inout_panel.setTo(cv::Scalar(25, 26, 26));
+  int y = 20;
+
+  const double done = in_route.ArcAt(in_step);
+  cv::putText(inout_panel, "ROUTE", {8, y}, kFont, 0.42, kInk, 1, cv::LINE_AA);
+  // A percentage only means something against a route that has an end
+  if (in_route.HasGoal() && in_route.RouteLength() > 0.0) {
+    cv::putText(inout_panel, cv::format("%.0f%%", 100.0 * done / in_route.RouteLength()),
+                {96, y}, kFont, 0.42, kInk, 1, cv::LINE_AA);
+  }
+  y += 8;
+  cv::line(inout_panel, {8, y}, {inout_panel.cols - 8, y}, cv::Scalar(45, 47, 47), 1);
+  y += 20;
+
+  // What the model is steering at right now, before any of the derived numbers
+  cv::putText(inout_panel, "subgoal", {8, y}, kFont, 0.38, kSub, 1, cv::LINE_AA);
+  cv::putText(inout_panel, cv::format("%.0f m", in_subgoal_m), {96, y}, kFont, 0.38, kSub, 1,
+              cv::LINE_AA);
+  y += 20;
+
+  if (!in_route.HasGoal()) {
+    cv::putText(inout_panel, "goal beyond", {8, y}, kFont, 0.38, kMuted, 1, cv::LINE_AA);
+    cv::putText(inout_panel, "this clip", {8, y + 16}, kFont, 0.38, kMuted, 1, cv::LINE_AA);
+    return;
+  }
+
+  // The next few milestones, then the destination -- a passed milestone drops
+  // off the list rather than counting down into negative metres
+  int shown = 0;
+  for (const visualizer::RouteMilestone &m : in_route.Milestones()) {
+    const double left = m.s_m - done;
+    if (m.is_goal) {
+      cv::putText(inout_panel, "GOAL", {8, y}, kFont, 0.40, kGoal, 1, cv::LINE_AA);
+      cv::putText(inout_panel, cv::format("%.0f m", std::max(left, 0.0)), {96, y}, kFont, 0.40,
+                  kGoal, 1, cv::LINE_AA);
+      break;
+    }
+    if (left < 0.0 || shown >= 3) continue;
+    cv::putText(inout_panel, cv::format("M%d", m.label), {8, y}, kFont, 0.38, kInk, 1, cv::LINE_AA);
+    cv::putText(inout_panel, cv::format("%.0f m", left), {96, y}, kFont, 0.38, kInk, 1, cv::LINE_AA);
+    y += 18;
+    ++shown;
+  }
+}
+
 // @brief: This function streams one clip and renders each step as a camera
 // panel (rainbow prediction ribbon + ground-truth line + deployment HUD) beside
 // the BEV, written as an mp4 (PNG directory when no video encoder is built in)
@@ -383,6 +445,48 @@ static int Visualize() {
   const std::string out_video =
       FLAGS_out_video.empty() ? "viz_" + FLAGS_clip + ".mp4" : FLAGS_out_video;
 
+  // --- clip-wide context for the timeline band ---------------------------
+  // The route, the speed profile and the value axes are all knowable before a
+  // single frame is rendered, so the band's geometry is fixed up front and
+  // only the playhead moves
+  const auto        status_all = utils::LoadNpy((clip_dir / "status.npy").string());
+  const std::size_t n_steps    = std::min<std::size_t>(sequence["steps"].size(),
+                                                       status_all.data.size() / planner::kStatusDim);
+
+  std::map<int, visualizer::MapPose> frame_pose;
+  for (const auto &f : sequence["frames"]) {
+    frame_pose[f["frame"].get<int>()] = {f["ego_xy"][0].get<double>(),
+                                         f["ego_xy"][1].get<double>(),
+                                         f["ego_yaw"].get<double>()};
+  }
+
+  std::vector<visualizer::MapPose> poses;
+  std::vector<cv::Point2d>         subgoals_ego;
+  double                           speed_max = 1.0;
+  for (std::size_t k = 0; k < n_steps; ++k) {
+    const float *st = status_all.data.data() + k * planner::kStatusDim;
+    poses.push_back(frame_pose[sequence["steps"][k]["frame"].get<int>()]);
+    subgoals_ego.emplace_back(st[0] * 10.0, st[1] * 10.0);
+    speed_max = std::max(speed_max, static_cast<double>(std::hypot(st[2], st[3])));
+  }
+
+  auto route_ptr = visualizer::CreateRouteMap(poses, subgoals_ego);
+
+  const double speed_axis      = std::ceil(speed_max / 5.0) * 5.0;
+  auto         speed_strip_ptr = visualizer::CreateSignalStrip(
+      {"speed", "m/s", 0.0, speed_axis, n_steps},
+      {{"speed", cv::Scalar(120, 210, 90), false}});
+
+  // How much the +4 s end of the plan shifts from one step to the next. The
+  // reach is ego-relative, so a steady drive holds it flat and everything left
+  // on this strip is the plan disagreeing with itself -- which is exactly what
+  // the smoother is there to take out, so both traces are shown
+  auto plan_strip_ptr = visualizer::CreateSignalStrip(
+      {"plan drift", "m / step", 0.0, 2.0, n_steps},
+      {{"raw", cv::Scalar(120, 120, 120), true},
+       {"drawn", visualizer::HorizonColor(1.0), false}});
+  double prev_reach_raw = -1.0, prev_reach_drawn = -1.0;
+
   cv::VideoWriter writer;
   bool            use_video = true;
   fs::path        png_dir;
@@ -391,6 +495,7 @@ static int Visualize() {
   const double    step_period_s = 1.0 / std::max(sequence.value("fps", FLAGS_fps), 1);
 
   constexpr int    kPanelHeight = 560;
+  constexpr int    kBandHeight  = 200;
   const cv::Scalar kGood{120, 210, 90};  // green: within tolerance / fast
   const cv::Scalar kInk{225, 225, 225};  // near-white value text
   const cv::Scalar kSeparator{45, 47, 47};
@@ -482,12 +587,44 @@ static int Visualize() {
                cols.push_back(kInk);
                DrawHud(cam_panel, rows, cols);
 
-               // --- compose: camera | separator | BEV ---
-               cv::Mat frame(kPanelHeight, cam_panel.cols + 2 + bev_panel.cols, CV_8UC3,
-                             kSeparator);
+               // --- timeline band: route ledger + stability strips ---
+               speed_strip_ptr->Push({speed});
+               const double reach_raw   = std::hypot(pred.back().x, pred.back().y);
+               const double reach_drawn = std::hypot(shown.back().x, shown.back().y);
+               plan_strip_ptr->Push({prev_reach_raw < 0 ? 0.0 : std::abs(reach_raw - prev_reach_raw),
+                                     prev_reach_drawn < 0
+                                         ? 0.0
+                                         : std::abs(reach_drawn - prev_reach_drawn)});
+               prev_reach_raw   = reach_raw;
+               prev_reach_drawn = reach_drawn;
+
+               // --- compose: camera | separator | BEV, over the timeline band ---
+               const int total_w = cam_panel.cols + 2 + bev_panel.cols;
+               const int band_h  = FLAGS_timeline ? kBandHeight : 0;
+               cv::Mat   frame(kPanelHeight + (band_h > 0 ? band_h + 2 : 0), total_w, CV_8UC3,
+                               kSeparator);
                cam_panel.copyTo(frame(cv::Rect(0, 0, cam_panel.cols, kPanelHeight)));
                bev_panel.copyTo(
                    frame(cv::Rect(cam_panel.cols + 2, 0, bev_panel.cols, kPanelHeight)));
+
+               if (band_h > 0) {
+                 constexpr int kMapW    = 300;
+                 constexpr int kLedgerW = 150;
+                 const int     band_y   = kPanelHeight + 2;
+                 const int     strips_x = kMapW + kLedgerW + 4;
+                 const int     strips_w = std::max(total_w - strips_x, 1);
+                 const int     strip_h  = (band_h - 2) / 2;
+
+                 route_ptr->Draw({kMapW, band_h}, k)
+                     .copyTo(frame(cv::Rect(0, band_y, kMapW, band_h)));
+                 cv::Mat ledger = frame(cv::Rect(kMapW + 2, band_y, kLedgerW, band_h));
+                 DrawRouteLedger(ledger, *route_ptr, k, std::hypot(status[0] * 10.f, status[1] * 10.f));
+                 speed_strip_ptr->Draw({strips_w, strip_h})
+                     .copyTo(frame(cv::Rect(strips_x, band_y, strips_w, strip_h)));
+                 plan_strip_ptr->Draw({strips_w, band_h - strip_h - 2})
+                     .copyTo(frame(cv::Rect(strips_x, band_y + strip_h + 2, strips_w,
+                                            band_h - strip_h - 2)));
+               }
 
                if (k == 0) {
                  // VideoWriter does not create the parent directory; without
