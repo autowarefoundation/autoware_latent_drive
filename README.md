@@ -84,7 +84,8 @@ latentdrive-trt --mode=run-package --engine_file=E.engine --package_dir=/data \
 latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
     --clip=follow_lane --out_video=viz/follow_lane.mp4 \
     [--smooth_alpha=0.35]                        # temporal smoothing of the DRAWN plan
-    [--timeline=false]                           # drop the route + stability band
+    [--timeline=false]                           # drop the route + speed band
+    [--plan_drift]                               # add the plan-drift strip (development)
 ```
 
 `run-package` writes the `.npy` outputs the package's `validate.py` scores
@@ -102,11 +103,14 @@ serves both checkpoints. The fp16 build's fp32-pin recipe lives in
   not the band says so instead of inventing one. Milestones are cut from that
   trace at a round spacing, and the ledger counts down the metres still owed to
   the next few and to the goal.
-- **speed** and **plan drift** -- speed straight from `status.npy`, and how far
-  the +4 s end of the plan moves per step. The reach is ego-relative, so a
-  steady drive holds the drift flat and what is left is the plan disagreeing
-  with itself; the raw and drawn traces are overlaid, which is what makes the
-  smoothing below visible rather than merely claimed.
+- **speed** -- straight from `status.npy`, in km/h, against the clip's own
+  timeline.
+- **plan drift**, behind `--plan_drift` -- how far the +4 s end of the plan
+  moves per step. The reach is ego-relative, so a steady drive holds it flat
+  and what is left is the plan disagreeing with itself; the raw and drawn
+  traces are overlaid, which is what makes the smoothing below visible rather
+  than merely claimed. It answers a question about the model rather than about
+  the drive, so it is off unless asked for.
 
 `visualize` draws a temporally smoothed plan: consecutive frames disagree by
 about a metre on how far the plan reaches, which reads as a tail that pulses

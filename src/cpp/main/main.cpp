@@ -33,6 +33,9 @@ using namespace std;
 namespace fs      = std::filesystem;
 namespace planner = model::planner;
 
+// The model works in m/s; the panels report the number a driver would read
+constexpr double kMps2Kmh = 3.6;
+
 // Mode flags
 DEFINE_string(mode, "",
               "Operating mode (options: build-engine, run-package, visualize)");
@@ -66,7 +69,11 @@ DEFINE_string(out_video, "", "Output video path (default: viz_<clip>.mp4)");
 DEFINE_int32(fps, 10, "Frames per second of the output video");
 DEFINE_int32(png_every, 0, "Also dump a standalone PNG still every N steps (0 = off)");
 DEFINE_bool(timeline, true,
-            "visualize: draw the route + stability band under the camera/BEV row");
+            "visualize: draw the route + speed band under the camera/BEV row");
+DEFINE_bool(plan_drift, false,
+            "visualize: add the plan-drift strip to the band. A development "
+            "readout on how much the plan disagrees with itself per step, not "
+            "something a demo audience needs");
 DEFINE_double(smooth_alpha, 0.35,
               "visualize: weight of the fresh plan when smoothing the DRAWN "
               "trajectory across steps (1.0 = draw the raw plan). Display "
@@ -472,19 +479,23 @@ static int Visualize() {
 
   auto route_ptr = visualizer::CreateRouteMap(poses, subgoals_ego);
 
-  const double speed_axis      = std::ceil(speed_max / 5.0) * 5.0;
+  const double speed_axis      = std::ceil(speed_max * kMps2Kmh / 10.0) * 10.0;
   auto         speed_strip_ptr = visualizer::CreateSignalStrip(
-      {"speed", "m/s", 0.0, speed_axis, n_steps},
+      {"speed", "km/h", 0.0, speed_axis, n_steps},
       {{"speed", cv::Scalar(120, 210, 90), false}});
 
   // How much the +4 s end of the plan shifts from one step to the next. The
   // reach is ego-relative, so a steady drive holds it flat and everything left
   // on this strip is the plan disagreeing with itself -- which is exactly what
-  // the smoother is there to take out, so both traces are shown
-  auto plan_strip_ptr = visualizer::CreateSignalStrip(
-      {"plan drift", "m / step", 0.0, 2.0, n_steps},
-      {{"raw", cv::Scalar(120, 120, 120), true},
-       {"drawn", visualizer::HorizonColor(1.0), false}});
+  // the smoother is there to take out, so both traces are shown. Off by
+  // default: it answers a question about the model, not about the drive
+  std::shared_ptr<visualizer::SignalStrip> plan_strip_ptr;
+  if (FLAGS_plan_drift) {
+    plan_strip_ptr = visualizer::CreateSignalStrip(
+        {"plan drift", "m / step", 0.0, 2.0, n_steps},
+        {{"raw", cv::Scalar(120, 120, 120), true},
+         {"drawn", visualizer::HorizonColor(1.0), false}});
+  }
   double prev_reach_raw = -1.0, prev_reach_drawn = -1.0;
 
   cv::VideoWriter writer;
@@ -582,21 +593,22 @@ static int Visualize() {
                  const float *gt_last = gt.data.data() + k * row_numel + (num_waypoints - 1) * 3;
                  intent += cv::format(" (GT %.1f)", std::hypot(gt_last[0], gt_last[1]));
                }
-               intent += cv::format("  v %.1f m/s", speed);
+               intent += cv::format("  v %.1f km/h", speed * kMps2Kmh);
                rows.push_back({"intent", intent});
                cols.push_back(kInk);
                DrawHud(cam_panel, rows, cols);
 
                // --- timeline band: route ledger + stability strips ---
-               speed_strip_ptr->Push({speed});
-               const double reach_raw   = std::hypot(pred.back().x, pred.back().y);
-               const double reach_drawn = std::hypot(shown.back().x, shown.back().y);
-               plan_strip_ptr->Push({prev_reach_raw < 0 ? 0.0 : std::abs(reach_raw - prev_reach_raw),
-                                     prev_reach_drawn < 0
-                                         ? 0.0
-                                         : std::abs(reach_drawn - prev_reach_drawn)});
-               prev_reach_raw   = reach_raw;
-               prev_reach_drawn = reach_drawn;
+               speed_strip_ptr->Push({speed * kMps2Kmh});
+               if (plan_strip_ptr) {
+                 const double reach_raw   = std::hypot(pred.back().x, pred.back().y);
+                 const double reach_drawn = std::hypot(shown.back().x, shown.back().y);
+                 plan_strip_ptr->Push(
+                     {prev_reach_raw < 0 ? 0.0 : std::abs(reach_raw - prev_reach_raw),
+                      prev_reach_drawn < 0 ? 0.0 : std::abs(reach_drawn - prev_reach_drawn)});
+                 prev_reach_raw   = reach_raw;
+                 prev_reach_drawn = reach_drawn;
+               }
 
                // --- compose: camera | separator | BEV, over the timeline band ---
                const int total_w = cam_panel.cols + 2 + bev_panel.cols;
@@ -613,7 +625,9 @@ static int Visualize() {
                  const int     band_y   = kPanelHeight + 2;
                  const int     strips_x = kMapW + kLedgerW + 4;
                  const int     strips_w = std::max(total_w - strips_x, 1);
-                 const int     strip_h  = (band_h - 2) / 2;
+                 // Speed alone gets the whole height; the drift strip, when
+                 // asked for, splits it
+                 const int strip_h = plan_strip_ptr ? (band_h - 2) / 2 : band_h;
 
                  route_ptr->Draw({kMapW, band_h}, k)
                      .copyTo(frame(cv::Rect(0, band_y, kMapW, band_h)));
@@ -621,9 +635,11 @@ static int Visualize() {
                  DrawRouteLedger(ledger, *route_ptr, k, std::hypot(status[0] * 10.f, status[1] * 10.f));
                  speed_strip_ptr->Draw({strips_w, strip_h})
                      .copyTo(frame(cv::Rect(strips_x, band_y, strips_w, strip_h)));
-                 plan_strip_ptr->Draw({strips_w, band_h - strip_h - 2})
-                     .copyTo(frame(cv::Rect(strips_x, band_y + strip_h + 2, strips_w,
-                                            band_h - strip_h - 2)));
+                 if (plan_strip_ptr) {
+                   plan_strip_ptr->Draw({strips_w, band_h - strip_h - 2})
+                       .copyTo(frame(cv::Rect(strips_x, band_y + strip_h + 2, strips_w,
+                                              band_h - strip_h - 2)));
+                 }
                }
 
                if (k == 0) {
