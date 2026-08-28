@@ -14,8 +14,32 @@ It links the parent repo's inference/visualizer core (`Planner`, `FrameWindow`,
 | sub | `/sensing/camera/camera1/image_raw/compressed` | CompressedImage | front camera (CAM_FRONT_WIDE), 10 Hz |
 | sub | `/localization/kinematic_state` | nav_msgs/Odometry | ego pose + velocity |
 | sub | `/localization/acceleration` | geometry_msgs/AccelWithCovarianceStamped | ego acceleration |
-| pub | `~/viz` | sensor_msgs/Image | camera ribbon + BEV panel |
+| pub | `~/viz/compressed` | sensor_msgs/CompressedImage | camera ribbon + BEV panel, JPEG — **the one to view** |
+| pub | `~/viz` | sensor_msgs/Image | the same panel raw; only published while something subscribes |
 | pub | `~/plan` | nav_msgs/Path | predicted trajectory (base_link) |
+
+Both `~/viz` topics are **best-effort, keep-last** (`SensorDataQoS`), like the
+camera topics they mirror — a viewer must never be able to slow the planner
+down. Subscribe with a matching best-effort profile (rqt_image_view has a QoS
+selector; `qos_profile_sensor_data` in rclpy).
+
+Drawing, JPEG encoding and publishing run on their own thread, fed by a
+one-slot mailbox: if a viewer or the encoder falls behind, the pending frame is
+replaced rather than queued, and the image callback never waits. That matters
+for more than smoothness — a blocked callback drops camera frames, and dropped
+frames put the wrong spacing into the 4-frame history the model reads.
+
+Measured on a 60 s bag (10 Hz camera, RTX-class GPU, viewer attached):
+
+| | before | after |
+|---|---|---|
+| viz message size | 2.41 MB | 122 kB |
+| `~/viz` rate | 4.1 Hz, gaps to 1.3 s | 8.8 Hz, no gaps |
+| `~/plan` rate | 5.7 Hz, gaps to 1.7 s | 8.1 Hz, gaps to 0.7 s |
+| dropped-frame resets | 1-5 per run | 0 |
+
+Image callback budget: 39 ms median of the 100 ms period (JPEG decode of the
+2880x1860 frame 33, preprocess 1, inference 5). The viz thread takes 6 ms.
 
 The **subgoal** (route point 50 m ahead) is read from `route.npy` — the ego's
 own driven path exported from the bag — because the container has no
@@ -57,7 +81,7 @@ ros2 bag play /path/to/bag_dir --topics \
     /sensing/camera/camera1/image_raw/compressed \
     /localization/kinematic_state /localization/acceleration
 
-# view it
+# view it (pick the "compressed" transport, or pass the compressed topic)
 ros2 run rqt_image_view rqt_image_view /latentdrive_node/viz
 ```
 
@@ -119,7 +143,8 @@ SSH or when no display is available.
 
 `engine_file`, `calibration_file`, `route_file`, `camera_topic`, `odom_topic`,
 `accel_topic`, `scene_match` (calibration entry substring, default `prd_jt`),
-`subgoal_ahead_m` (default 50), `smooth_alpha` (default 0.35).
+`subgoal_ahead_m` (default 50), `smooth_alpha` (default 0.35),
+`viz_jpeg_quality` (default 80).
 
 `smooth_alpha` is the weight of the fresh plan when smoothing the trajectory
 `~/viz` **draws**; `1.0` draws the raw output, lower is smoother and laggier.

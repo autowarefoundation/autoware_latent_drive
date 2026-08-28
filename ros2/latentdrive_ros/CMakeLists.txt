@@ -51,8 +51,9 @@ target_link_libraries(latentdrive_core
 # ============================================================================
 # ROS 2 node
 # ============================================================================
+find_package(Threads REQUIRED)
 add_executable(latentdrive_node src/latentdrive_node.cpp)
-target_link_libraries(latentdrive_node latentdrive_core ${OpenCV_LIBS})
+target_link_libraries(latentdrive_node latentdrive_core ${OpenCV_LIBS} Threads::Threads)
 ament_target_dependencies(latentdrive_node rclcpp sensor_msgs nav_msgs geometry_msgs)
 
 install(TARGETS latentdrive_node DESTINATION lib/${PROJECT_NAME})
