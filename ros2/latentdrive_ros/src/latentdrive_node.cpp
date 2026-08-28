@@ -81,6 +81,7 @@ class LatentDriveNode : public rclcpp::Node {
     subgoal_ahead_m_ = declare_parameter<double>("subgoal_ahead_m", 50.0);
     const auto smooth_alpha = declare_parameter<double>("smooth_alpha", 0.35);
     viz_jpeg_quality_ = static_cast<int>(declare_parameter<int64_t>("viz_jpeg_quality", 80));
+    const auto viz_reliable = declare_parameter<bool>("viz_reliable", false);
     const auto camera_topic = declare_parameter<std::string>(
         "camera_topic", "/sensing/camera/camera1/image_raw/compressed");
     const auto odom_topic = declare_parameter<std::string>(
@@ -125,9 +126,10 @@ class LatentDriveNode : public rclcpp::Node {
     // viewer that falls behind blocks the publisher, and the stall reaches the
     // image callback as dropped camera frames (measured: 5.7 Hz with a viewer
     // attached and four "stamp jumped" resets over a 60 s bag)
-    pub_viz_ = create_publisher<sensor_msgs::msg::Image>("~/viz", sensor_qos);
+    const rclcpp::QoS viz_qos = viz_reliable ? rclcpp::QoS(1).reliable() : sensor_qos;
+    pub_viz_ = create_publisher<sensor_msgs::msg::Image>("~/viz", viz_qos);
     pub_viz_jpeg_ =
-        create_publisher<sensor_msgs::msg::CompressedImage>("~/viz/compressed", sensor_qos);
+        create_publisher<sensor_msgs::msg::CompressedImage>("~/viz/compressed", viz_qos);
     pub_plan_ = create_publisher<nav_msgs::msg::Path>("~/plan", 1);
 
     viz_thread_ = std::thread(&LatentDriveNode::VizLoop, this);
