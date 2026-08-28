@@ -259,7 +259,9 @@ class LatentDriveNode : public rclcpp::Node {
 
     const float speed = std::hypot(ego.vel_x, ego.vel_y);
     const float wp = std::hypot(plan.back().x, plan.back().y);
-    cv::putText(cam_panel, cv::format("LatentDrive TRT  v %.1f m/s  |4s| %.1f m", speed, wp),
+    // km/h on the overlay, to match the offline visualizer; the log line below
+    // stays in m/s, which is the unit the model and the odometry work in
+    cv::putText(cam_panel, cv::format("LatentDrive TRT  v %.1f km/h  |4s| %.1f m", speed * 3.6f, wp),
                 {12, 28}, cv::FONT_HERSHEY_DUPLEX, 0.6, {230, 230, 230}, 1, cv::LINE_AA);
 
     cv::Mat frame(H, cam_panel.cols + 2 + bev_panel.cols, CV_8UC3, cv::Scalar(45, 47, 47));
