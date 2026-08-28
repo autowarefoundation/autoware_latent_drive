@@ -34,6 +34,7 @@
 #include "npy.hpp"
 #include "planner.hpp"
 #include "trajectory.hpp"
+#include "trajectory_smoother.hpp"
 
 using namespace std::chrono_literals;
 
@@ -73,6 +74,7 @@ class LatentDriveNode : public rclcpp::Node {
     const auto route = declare_parameter<std::string>("route_file", "");
     const auto scene_match = declare_parameter<std::string>("scene_match", "prd_jt");
     subgoal_ahead_m_ = declare_parameter<double>("subgoal_ahead_m", 50.0);
+    const auto smooth_alpha = declare_parameter<double>("smooth_alpha", 0.35);
     const auto camera_topic = declare_parameter<std::string>(
         "camera_topic", "/sensing/camera/camera1/image_raw/compressed");
     const auto odom_topic = declare_parameter<std::string>(
@@ -83,6 +85,10 @@ class LatentDriveNode : public rclcpp::Node {
     planner_ = model::planner::CreatePlanner(engine);
     window_ = preprocess::CreateFrameWindow();
     bev_ = visualizer::CreateBevVisualizer();
+    // Display only: ~/plan carries the raw engine output, the overlay is what
+    // gets filtered. Consecutive plans disagree by about a metre on how far
+    // they reach, which makes the BEV tail pulse in and out
+    smoother_ = visualizer::CreateTrajectorySmoother({smooth_alpha});
     projector_ = LoadProjector(calib, scene_match);
     if (!planner_ || !window_ || !bev_) {
       throw std::runtime_error("failed to init planner/window/bev");
@@ -191,12 +197,32 @@ class LatentDriveNode : public rclcpp::Node {
     window_->Assemble(planner_->VideoInput());
     const common::Trajectory plan = planner_->ForwardPrepared(ego.Encode());
 
+    const common::Trajectory &shown = Smoothed(plan, msg->header.stamp);
     PublishPlan(plan, msg->header.stamp);
-    PublishViz(CropResize(frame), plan, ego);
+    PublishViz(CropResize(frame), shown, ego);
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                          "planning: v=%.1f m/s  |4s|=%.1f m", std::hypot(ego.vel_x, ego.vel_y),
                          std::hypot(plan.back().x, plan.back().y));
+  }
+
+  // @brief: the plan to draw. The smoother carries the previous one forward by
+  // the gap between camera stamps, so it needs a gap it can trust: a bag that
+  // loops or seeks hands us a stamp jump, and carrying a plan across one would
+  // smear a stale trajectory over the overlay for several frames
+  const common::Trajectory &Smoothed(const common::Trajectory &plan,
+                                     const builtin_interfaces::msg::Time &stamp) {
+    const rclcpp::Time now_stamp(stamp);
+    const double dt = have_stamp_ ? (now_stamp - prev_stamp_).seconds() : 0.0;
+    if (have_stamp_ && (dt <= 0.0 || dt > kMaxGapS)) {
+      RCLCPP_WARN(get_logger(), "camera stamp jumped %.2f s -- resetting the plan filter", dt);
+      smoother_->Reset();
+    }
+    prev_stamp_ = now_stamp;
+    have_stamp_ = true;
+
+    shown_ = smoother_->Update(plan, dt > 0.0 ? dt : kNominalPeriodS);
+    return shown_;
   }
 
   void PublishPlan(const common::Trajectory &plan, const rclcpp::Time &stamp) {
@@ -255,8 +281,19 @@ class LatentDriveNode : public rclcpp::Node {
   std::shared_ptr<preprocess::FrameWindow> window_;
   std::shared_ptr<visualizer::BevVisualizer> bev_;
   std::shared_ptr<visualizer::CameraProjector> projector_;
+  std::shared_ptr<visualizer::TrajectorySmoother> smoother_;
   std::vector<std::pair<double, double>> route_;
   double subgoal_ahead_m_ = 50.0;
+
+  // Camera runs at 10 Hz; the nominal period only stands in for the first
+  // frame and for a gap the filter has just been reset over
+  static constexpr double kNominalPeriodS = 0.1;
+  static constexpr double kMaxGapS = 1.0;
+  // Explicitly ROS time: subtracting two rclcpp::Time of different clock
+  // types throws, and the default construction is system time
+  rclcpp::Time prev_stamp_{0, 0, RCL_ROS_TIME};
+  bool have_stamp_ = false;
+  common::Trajectory shown_;
 
   nav_msgs::msg::Odometry::ConstSharedPtr odom_;
   geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr accel_;

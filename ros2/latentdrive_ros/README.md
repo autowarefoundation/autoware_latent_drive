@@ -119,4 +119,13 @@ SSH or when no display is available.
 
 `engine_file`, `calibration_file`, `route_file`, `camera_topic`, `odom_topic`,
 `accel_topic`, `scene_match` (calibration entry substring, default `prd_jt`),
-`subgoal_ahead_m` (default 50).
+`subgoal_ahead_m` (default 50), `smooth_alpha` (default 0.35).
+
+`smooth_alpha` is the weight of the fresh plan when smoothing the trajectory
+`~/viz` **draws**; `1.0` draws the raw output, lower is smoother and laggier.
+The engine is deterministic per frame, but consecutive frames disagree by about
+a metre on how far the plan reaches, which makes the BEV tail pulse in and out.
+It is display only: `~/plan` always publishes the raw engine output. The filter
+carries the previous plan forward by the gap between camera stamps, and resets
+itself when that gap goes backwards or exceeds a second, so replaying a looping
+bag does not smear a stale plan across the overlay.
