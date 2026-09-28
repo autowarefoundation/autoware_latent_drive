@@ -3,7 +3,9 @@
 Standalone TensorRT C++ inference framework for the LatentDrive e2e planner
 (a V-JEPA2 ViT-L encoder feeding a planner transformer). It is the layer the
 ROS 2 node sits on: the library knows nothing about ROS, files or JSON —
-it takes camera frames and ego status, and returns a trajectory.
+it takes camera frames and ego status, and returns a trajectory. It serves the
+single-view checkpoints (wide front camera) and the two-view ones (wide front
++ telephoto) from one binary; the engine file decides which.
 
 ## Demo
 
@@ -90,9 +92,19 @@ latentdrive-trt --mode=visualize --engine_file=E.engine --package_dir=/data \
 
 `run-package` writes the `.npy` outputs the package's `validate.py` scores
 (`python3 validate.py` → 11/11 for the 8-waypoint model). The waypoint count
-(8 at 2 Hz, 40 at 10 Hz) is read from the engine at load, so the same binary
-serves both checkpoints. The fp16 build's fp32-pin recipe lives in
-`engine_builder.cpp`.
+(8 at 2 Hz, 40 at 10 Hz) and the view count (1 or 2 cameras) are read from
+the engine at load, so the same binary serves every checkpoint. The fp16
+build's fp32-pin recipe lives in `engine_builder.cpp`; an ONNX whose batch
+axis is symbolic (the closed-loop and two-view exports) is frozen to batch 1
+by an optimization profile there, so it builds like a fixed-shape one.
+
+A two-view engine needs the telephoto stream as well. Offline that is a second
+clip directory, `<clip>/far` by default or `--far_clip_dir=DIR`, with the same
+layout as the wide clip (`frames/*.jpg` + `sequence.json` carrying `t_us` per
+frame); `--view_tolerance_s` (default 0.06) bounds how far a telephoto frame
+may be from the wide frame it is paired with, and a step with no such frame
+is skipped and reported — never filled with a substitute frame. See
+[Two-view mode](#two-view-mode).
 
 `visualize` renders the camera ribbon and the BEV over a timeline band:
 
@@ -123,17 +135,55 @@ raw engine output.
 
 | tensor | shape | meaning |
 |---|---|---|
-| `video` | `[1,3,4,256,512]` | 4 front-camera frames, oldest→newest, 0.5 s apart, RGB, ImageNet-normalized |
+| `video` | `[1,3,4,256,512]` | single-view: 4 front-camera frames, oldest→newest, 0.5 s apart, RGB, ImageNet-normalized |
+| `video` | `[1,2,3,4,256,512]` | two-view: the same for 2 cameras — view 0 = wide front, view 1 = telephoto, frame-aligned in time |
 | `status` | `[1,6]` | `[subgoal_x/10, subgoal_y/10, vel_x, vel_y, acc_x, acc_y]`, ego frame |
-| `traj` | `[1,N,3]` | N waypoints (8 at 2 Hz, 40 at 10 Hz) over t+0.5…4.0 s: `(x fwd [m], y left [m], heading [rad])` |
+| `traj` / `plan` | `[1,N,3]` | N waypoints (8 at 2 Hz, 40 at 10 Hz) over t+0.5…4.0 s: `(x fwd [m], y left [m], heading [rad])` |
 
-The ONNX comes from `deployment/export_onnx.py` in the training repo
-(`kalfazed/LatentDrive`, opset 17); the engine builds either there via
-`trtexec` or here via `--mode=build-engine` (TensorRT C++ builder API). Both
-apply the same precision recipe — fp16 with the planner stage pinned to fp32 —
-and produce numerically identical results: validated 11/11 against the
-PyTorch reference, ~4.7 ms engine call / ~5.8 ms end-to-end per step on an
-RTX 4090 — 6% of the 10 Hz budget.
+The single-view ONNX comes from `deployment/export_onnx.py` in the training
+repo (`kalfazed/LatentDrive`, opset 17, fixed batch 1, output `traj`); the
+newer exports (closed-loop single-view, two-view) are opset 18 with a symbolic
+batch axis and the output named `plan`. The planner finds the output by IO
+mode and the engine build freezes the batch axis, so all of them load the same
+way. The engine builds either there via `trtexec` or here via
+`--mode=build-engine` (TensorRT C++ builder API). Both apply the same
+precision recipe — fp16 with the planner stage pinned to fp32 — and produce
+numerically identical results: validated 11/11 against the PyTorch reference,
+~4.7 ms engine call / ~5.8 ms end-to-end per step on an RTX 4090 — 6% of the
+10 Hz budget (single-view; the two-view model runs the encoder twice).
+
+## Two-view mode
+
+The two-view checkpoints (`models/onnx/multi-camera/`) read the wide front
+camera and the telephoto camera — on this vehicle
+`/sensing/camera/camera1/image_raw/compressed` and
+`/sensing/camera/camera2/image_raw/compressed`, both 2880x1860; camera2 has
+fx 5448 against camera1's 1486 (HFOV 29.6°). The input contract, matching
+`planner_io.py` in the closed-loop hand-off:
+
+- **Preprocessing** is the same for both views (`PreprocessFrame`): keep the
+  full width, centre-crop the rows to a 2:1 band, bilinear resize to 512x256,
+  /255, ImageNet mean/std, CHW. The telephoto frame is a separate sensor's
+  full frame, not a crop of the wide image.
+- **History** (`PickHistory`): the wide camera anchors the four slots. For the
+  newest wide frame at t, each slot takes the wide frame nearest in *time* to
+  t-1.5, t-1.0, t-0.5, t — never by counting frames, so a dropped frame moves
+  one slot rather than every older one.
+- **Alignment** (`ViewWindow`): for each chosen wide frame, the telephoto frame
+  nearest in time, within `view_tolerance_s` (default 0.06 s, what the offline
+  alignment used; the cameras are not hardware-synchronised). A slot with no
+  telephoto frame inside the tolerance fails the whole selection: that
+  inference is **skipped and reported**. No grey, black or duplicated frame is
+  ever substituted — the model has only seen real telephoto frames.
+- **Layout**: `[1, V, 3, 4, 256, 512]` is V contiguous `[3, 4, H, W]`
+  channel-major blocks, view 0 first; `Planner::VideoNumel()` is V times the
+  single-view size.
+
+The mode is chosen by configuration alone: the engine's `video` rank sets the
+view count (`Planner::NumViews()`), the ROS 2 node subscribes to the telephoto
+topic only when that is 2, and the offline tools read the telephoto clip only
+then. `tests/test_view_window.cpp` covers the history pick, the tolerance
+rejection and the tensor layout (`ctest --test-dir build`).
 
 ## ROS 2 interface
 
@@ -142,19 +192,25 @@ RTX 4090 — 6% of the 10 Hz budget.
 #include "planner.hpp"
 
 auto planner = model::planner::CreatePlanner("e2e-fp16-mixed.engine");
-auto window  = preprocess::CreateFrameWindow();  // 16-frame ring buffer @ 10 Hz
+preprocess::ViewWindowParams params;
+params.num_views = planner->NumViews();          // 1 or 2, from the engine
+auto window = preprocess::CreateViewWindow(params);
 
-// camera callback (10 Hz): each frame is preprocessed exactly once
-window->Push(bgr_frame);          // any resolution; crop + resize + normalize
+// camera callbacks (10 Hz): each frame is preprocessed exactly once
+window->Push(0, wide_bgr, stamp_s);              // any resolution; crop + resize + normalize
+window->Push(1, tele_bgr, stamp_s);              // two-view engines only
 
-// planning tick: assemble the 4-slot window and run the engine
-if (window->Ready()) {
-  window->Assemble(planner->VideoInput());   // zero-copy into pinned memory
+// planning tick: pick the history by timestamp, align the views, run
+const preprocess::ViewSelection sel = window->Assemble(planner->VideoInput());
+if (sel.ok) {                                    // else sel.reason says which view/slot lacks a frame
   common::EgoStatus ego{.subgoal_x_m = sx, .subgoal_y_m = sy,
                         .vel_x = vx, .vel_y = vy, .acc_x = ax, .acc_y = ay};
   common::Trajectory traj = planner->ForwardPrepared(ego.Encode());
 }
 ```
+
+`FrameWindow` (count-based, single view) is still there for the hand-off
+package, whose clips define the history by frame index.
 
 The visualizers (`BevVisualizer`, `CameraProjector`) draw on plain `cv::Mat`,
 so a node can publish the same canvas as `sensor_msgs/Image`.
@@ -169,9 +225,10 @@ include/
   utils/        npy reader/writer
 src/cpp/
   common/       logger, timer
-  latentdrive/  PlannerImpl (TensorRT), FrameWindowImpl (preprocessing)
+  latentdrive/  PlannerImpl (TensorRT), FrameWindowImpl / ViewWindowImpl (preprocessing)
   visualizer/   BevVisualizerImpl, CameraProjectorImpl
   main/         gflags mode dispatch (build-engine, run-package, visualize)
+tests/          ctest unit tests (history pick, view alignment, tensor layout)
 docker/         pilot-auto.xx1 deployment container (Dockerfile, build/run)
 ros2/           ROS 2 open-loop rosbag replay package (latentdrive_ros)
 ```
@@ -188,3 +245,4 @@ pointers (RAII), errors go through the `logger` macros.
 - [x] Camera-frame waypoint overlay
 - [x] In-framework engine build from ONNX (TensorRT C++ builder API)
 - [x] ROS 2 node — open-loop rosbag replay ([`ros2/latentdrive_ros`](ros2/latentdrive_ros))
+- [x] Two-view planner (wide front + telephoto), history by timestamp
