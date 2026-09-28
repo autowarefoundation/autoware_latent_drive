@@ -52,7 +52,13 @@ shell this opens; `NAME=ltrt` keeps the container alive between calls.
 cmake -B build && cmake --build build -j
 ```
 
-Produces `build/bin/latentdrive-trt`. One binary, three `--mode`s.
+Produces `build/bin/latentdrive-trt`. One binary, three `--mode`s. The unit
+tests (history pick, wide/telephoto alignment, tensor layout; no GPU needed)
+build alongside it:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
 
 ## 4. Build a TensorRT engine from ONNX
 
@@ -65,6 +71,13 @@ Produces `build/bin/latentdrive-trt`. One binary, three `--mode`s.
 fp16 with the planner stage pinned to fp32 (the validated recipe). `--prec=fp32`
 builds the control engine; `--pure_fp16` disables the pin (fails validation).
 Takes ~1 min on an RTX 4090.
+
+The same command builds the two-view export
+(`models/onnx/multi-camera/closed-loop-best/onnx/idx9-far-ego-jepa9-e1.onnx`,
+`video [batch, 2, 3, 4, 256, 512]`): its symbolic batch axis is frozen to 1 by
+an optimization profile, and the build log says `Video input is 6-D: 2 camera
+views`. Everything downstream (`run-package`, `visualize`, the ROS 2 node)
+reads the view count from the engine.
 
 ## 5. Validate + benchmark
 

@@ -1,8 +1,9 @@
 # latentdrive_ros
 
 Minimal ROS 2 (Jazzy) node for **open-loop rosbag replay** of the LatentDrive
-planner: replay a bag, run the engine live on the front camera + ego state, and
-publish the plan plus a camera-overlay + BEV visualization.
+planner: replay a bag, run the engine live on the front camera (+ the
+telephoto camera for a two-view engine) + ego state, and publish the plan plus
+a camera-overlay + BEV visualization.
 
 It links the parent repo's inference/visualizer core (`Planner`, `FrameWindow`,
 `BevVisualizer`, `CameraProjector`) — no autoware packages required.
@@ -11,7 +12,8 @@ It links the parent repo's inference/visualizer core (`Planner`, `FrameWindow`,
 
 | direction | topic | type | note |
 |---|---|---|---|
-| sub | `/sensing/camera/camera1/image_raw/compressed` | CompressedImage | front camera (CAM_FRONT_WIDE), 10 Hz |
+| sub | `/sensing/camera/camera1/image_raw/compressed` | CompressedImage | wide front camera (CAM_FRONT_WIDE, view 0), 10 Hz |
+| sub | `/sensing/camera/camera2/image_raw/compressed` | CompressedImage | telephoto camera (view 1), 10 Hz — **two-view engines only** |
 | sub | `/localization/kinematic_state` | nav_msgs/Odometry | ego pose + velocity |
 | sub | `/localization/acceleration` | geometry_msgs/AccelWithCovarianceStamped | ego acceleration |
 | pub | `~/viz/compressed` | sensor_msgs/CompressedImage | camera ribbon + BEV panel, JPEG — **the one to view** |
@@ -68,6 +70,63 @@ The **subgoal** (route point 50 m ahead) is read from `route.npy` — the ego's
 own driven path exported from the bag — because the container has no
 `autoware_planning_msgs` to parse `/planning/trajectory`. For open-loop replay
 the whole run is known, so this is a faithful route target.
+
+## Two-view engines (wide + telephoto)
+
+The engine file decides how many cameras the node reads: a `video` input of
+rank 5 is the single-view contract, rank 6 (`[1, 2, 3, 4, 256, 512]`) the
+two-view one, and only then does the node subscribe to `far_camera_topic`.
+Switching between the two is `engine_file` plus, if the vehicle wires it
+elsewhere, the topic — no rebuild.
+
+How the two streams are combined (`ViewWindow` in the core library, matching
+`planner_io.py` from the closed-loop hand-off):
+
+- the **wide** frame anchors the history: for the newest wide frame at t the
+  four slots are the wide frames nearest in *time* to t-1.5, t-1.0, t-0.5, t,
+  with no per-slot tolerance (a dropped wide frame moves one slot by a frame,
+  it does not skip the plan). `history_tolerance_s` (default 0.05 s) is the
+  warm-up gate: the wide history must span 1.5 s minus that before the first
+  plan, i.e. 16 frames at 10 Hz, as before;
+- each slot's **telephoto** frame is the one nearest in time to that wide
+  frame, within `view_tolerance_s` (default 0.06 s — the cameras are not
+  hardware-synchronised, and 60 ms is what the offline alignment used);
+- the cameras' newest frames do not arrive together, so a plan **waits** for
+  the telephoto frame belonging to its wide frame, at most until the
+  telephoto stream has passed the wide stamp + tolerance (the ego state is
+  sampled with the wide frame, so the wait does not shift what the plan
+  describes);
+- a slot that stays unmatched **skips the inference**. The skip is logged
+  (throttled, with a running count) and `~/plan` simply has no message for
+  that frame. No grey, black or duplicated frame is ever put into the
+  telephoto slot: the model was trained only on real telephoto frames, and a
+  fallback to a single-view engine is not implemented.
+
+The two JPEG decodes run side by side (one callback group per camera on a
+three-thread executor), so the per-frame CPU cost stays near the single-view
+one: decode 33 + 33 ms in parallel, preprocess 2, inference ~10 ms for the two
+encoder passes. Both views go through the same preprocessing (full width,
+rows centre-cropped to a 2:1 band, 512x256, ImageNet); the telephoto image is
+its own sensor's full frame, not a crop of the wide one. The overlay stays on
+the wide camera.
+
+```bash
+ros2 run latentdrive_ros latentdrive_node --ros-args \
+    -p engine_file:=/workspace/models/engine/idx9-far-ego-jepa9-e1-fp16-mixed.engine \
+    -p far_camera_topic:=/sensing/camera/camera2/image_raw/compressed \
+    -p view_tolerance_s:=0.06 \
+    -p calibration_file:=/workspace/sample_data/calibration.json \
+    -p route_file:=/path/to/bag_dir/route.npy
+# and play camera2 too:
+ros2 bag play /path/to/bag_dir --topics \
+    /sensing/camera/camera1/image_raw/compressed \
+    /sensing/camera/camera2/image_raw/compressed \
+    /localization/kinematic_state /localization/acceleration
+```
+
+The launch file does both: `replay.launch.py ... engine:=<two-view engine>`
+plays camera2 as well (`far_camera:=` to rename it, `view_tolerance_s:=` to
+widen the match).
 
 ## One-time prep (inside the deployment container)
 
@@ -165,8 +224,11 @@ SSH or when no display is available.
 
 ## Parameters
 
-`engine_file`, `calibration_file`, `route_file`, `camera_topic`, `odom_topic`,
-`accel_topic`, `scene_match` (calibration entry substring, default `prd_jt`),
+`engine_file`, `calibration_file`, `route_file`, `camera_topic`,
+`far_camera_topic` (default `/sensing/camera/camera2/image_raw/compressed`,
+read only by a two-view engine), `view_tolerance_s` (default 0.06),
+`history_tolerance_s` (default 0.05), `odom_topic`, `accel_topic`,
+`scene_match` (calibration entry substring, default `prd_jt`),
 `subgoal_ahead_m` (default 50), `smooth_alpha` (default 0.35),
 `viz_jpeg_quality` (default 80), `viz_reliable` (default false — see
 **Viewer QoS** above).
