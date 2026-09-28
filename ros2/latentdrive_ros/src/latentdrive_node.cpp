@@ -5,12 +5,25 @@
 // preloaded ego route, velocity + acceleration from the messages), runs the
 // engine, and publishes the plan plus a camera+BEV visualization image.
 //
+// The engine decides how many cameras that is: a single-view engine reads the
+// wide front camera alone, a two-view one also subscribes to the telephoto
+// camera. The wide frame anchors the four history slots (nearest stamp to
+// t-1.5, t-1.0, t-0.5, t); each telephoto slot is the frame nearest in time to
+// the chosen wide frame, within `view_tolerance_s`. The two cameras are not
+// synchronised, so the telephoto frame belonging to the newest wide frame may
+// still be in flight when that wide frame arrives: the plan waits for it, up
+// to the tolerance. A slot that stays unmatched skips the inference -- the
+// model was trained only on real telephoto frames, so no grey, black or
+// duplicated frame is ever put there. Switching between the two modes is a
+// matter of the engine file and the topic, not of a rebuild.
+//
 // The subgoal comes from route.npy (the ego's own driven path, exported by
 // scripts/export_route.py) because the container has no autoware_planning_msgs
 // to parse /planning/trajectory. For open-loop replay the whole run is known,
 // so "50 m of arc length ahead on the driven path" is a faithful route target.
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -84,13 +97,32 @@ class LatentDriveNode : public rclcpp::Node {
     const auto viz_reliable = declare_parameter<bool>("viz_reliable", false);
     const auto camera_topic = declare_parameter<std::string>(
         "camera_topic", "/sensing/camera/camera1/image_raw/compressed");
+    // Only subscribed when the engine takes two views. On this vehicle
+    // camera2 is the telephoto (fx 5448 vs camera1's 1486, HFOV 29.6 deg),
+    // the CAM_TRAFFIC_LIGHT_FAR the checkpoint's view 1 was trained on
+    far_camera_topic_ = declare_parameter<std::string>(
+        "far_camera_topic", "/sensing/camera/camera2/image_raw/compressed");
+    view_tolerance_s_ = declare_parameter<double>("view_tolerance_s",
+                                                  model::planner::kDefaultViewToleranceS);
+    const auto history_tolerance_s = declare_parameter<double>(
+        "history_tolerance_s", model::planner::kDefaultHistoryToleranceS);
     const auto odom_topic = declare_parameter<std::string>(
         "odom_topic", "/localization/kinematic_state");
     const auto accel_topic = declare_parameter<std::string>(
         "accel_topic", "/localization/acceleration");
 
     planner_ = model::planner::CreatePlanner(engine);
-    window_ = preprocess::CreateFrameWindow();
+    if (!planner_) throw std::runtime_error("failed to load the engine " + engine);
+    num_views_ = planner_->NumViews();
+    if (num_views_ > 2) {
+      throw std::runtime_error("engine takes " + std::to_string(num_views_) +
+                               " views; this node has sources for two (wide + telephoto)");
+    }
+    preprocess::ViewWindowParams window_params;
+    window_params.num_views = num_views_;
+    window_params.view_tolerance_s = view_tolerance_s_;
+    window_params.history_tolerance_s = history_tolerance_s;
+    window_ = preprocess::CreateViewWindow(window_params);
     bev_ = visualizer::CreateBevVisualizer();
     // Display only: ~/plan carries the raw engine output, the overlay is what
     // gets filtered. Consecutive plans disagree by about a metre on how far
@@ -107,19 +139,40 @@ class LatentDriveNode : public rclcpp::Node {
     LoadRoute(route);
 
     // warmup so the first real inference is not slow
-    const std::vector<float> zeros(model::planner::kVideoNumel, 0.f);
+    const std::vector<float> zeros(planner_->VideoNumel(), 0.f);
     for (int i = 0; i < 5; ++i) planner_->Forward(zeros.data(), {});
 
+    // Each camera gets its own mutually-exclusive callback group: under the
+    // multi-threaded executor the two JPEG decodes (~30 ms each for a
+    // 2880x1860 frame) overlap instead of serialising inside one 100 ms
+    // period, while the frames of one camera still arrive in order. What
+    // the callbacks share -- the window, the pending plan, the planner --
+    // sits behind plan_mutex_
     rclcpp::QoS sensor_qos = rclcpp::SensorDataQoS();
+    wide_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    far_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions wide_opts, far_opts;
+    wide_opts.callback_group = wide_group_;
+    far_opts.callback_group = far_group_;
     sub_img_ = create_subscription<sensor_msgs::msg::CompressedImage>(
         camera_topic, sensor_qos,
-        std::bind(&LatentDriveNode::OnImage, this, std::placeholders::_1));
+        std::bind(&LatentDriveNode::OnImage, this, std::placeholders::_1), wide_opts);
+    if (num_views_ >= 2) {
+      sub_far_ = create_subscription<sensor_msgs::msg::CompressedImage>(
+          far_camera_topic_, sensor_qos,
+          std::bind(&LatentDriveNode::OnFarImage, this, std::placeholders::_1), far_opts);
+    }
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
-        odom_topic, sensor_qos,
-        [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { odom_ = m; });
+        odom_topic, sensor_qos, [this](nav_msgs::msg::Odometry::ConstSharedPtr m) {
+          std::lock_guard<std::mutex> lock(plan_mutex_);
+          odom_ = m;
+        });
     sub_accel_ = create_subscription<geometry_msgs::msg::AccelWithCovarianceStamped>(
         accel_topic, sensor_qos,
-        [this](geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr m) { accel_ = m; });
+        [this](geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr m) {
+          std::lock_guard<std::mutex> lock(plan_mutex_);
+          accel_ = m;
+        });
 
     // Sensor QoS on the viz topics: best-effort, keep-last. A live overlay must
     // never apply back-pressure -- with the default reliable, depth-1 profile a
@@ -133,7 +186,16 @@ class LatentDriveNode : public rclcpp::Node {
     pub_plan_ = create_publisher<nav_msgs::msg::Path>("~/plan", 1);
 
     viz_thread_ = std::thread(&LatentDriveNode::VizLoop, this);
-    RCLCPP_INFO(get_logger(), "latentdrive_node ready (%d waypoints)", planner_->NumWaypoints());
+    if (num_views_ >= 2) {
+      RCLCPP_INFO(get_logger(),
+                  "latentdrive_node ready (2 views: wide %s + telephoto %s, tolerance %.0f ms, "
+                  "%d waypoints)",
+                  camera_topic.c_str(), far_camera_topic_.c_str(), view_tolerance_s_ * 1e3,
+                  planner_->NumWaypoints());
+    } else {
+      RCLCPP_INFO(get_logger(), "latentdrive_node ready (1 view: %s, %d waypoints)",
+                  camera_topic.c_str(), planner_->NumWaypoints());
+    }
   }
 
   ~LatentDriveNode() override {
@@ -193,14 +255,26 @@ class LatentDriveNode : public rclcpp::Node {
     return out;
   }
 
+  // @brief: wide camera. Every frame joins the window; once the ego state is
+  // there the frame becomes the pending plan, which runs right away for a
+  // single-view engine and as soon as the telephoto view is matched for a
+  // two-view one
   void OnImage(sensor_msgs::msg::CompressedImage::ConstSharedPtr msg) {
     const cv::Mat frame = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
     if (frame.empty()) return;
-    window_->Push(frame);
-    if (!window_->Ready() || !odom_) {
+    const double stamp_s = rclcpp::Time(msg->header.stamp).seconds();
+
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    if (pending_) {
+      // The previous wide frame never got its telephoto match; a newer wide
+      // frame supersedes it, and nothing is ever planned on a stale window
+      Skip("wide frame superseded before " + far_camera_topic_ +
+           " delivered a frame within tolerance");
+    }
+    window_->Push(0, frame, stamp_s);
+    if (!odom_) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-                           "warming up: window %d/16, odom=%s", window_->Size(),
-                           odom_ ? "ready" : "waiting");
+                           "warming up: wide %d frames, odom waiting", window_->Size(0));
       return;
     }
 
@@ -219,12 +293,56 @@ class LatentDriveNode : public rclcpp::Node {
       ego.acc_y = static_cast<float>(accel_->accel.accel.linear.y);
     }
 
-    // --- inference ---
-    window_->Assemble(planner_->VideoInput());
-    const common::Trajectory plan = planner_->ForwardPrepared(ego.Encode());
+    // The ego state is sampled now, with the wide frame, so a plan that waits
+    // for its telephoto frame still describes this instant
+    pending_ = Pending{stamp_s, msg->header.stamp, frame, ego};
+    TryPlan();
+  }
 
-    const common::Trajectory &shown = Smoothed(plan, msg->header.stamp);
-    PublishPlan(plan, msg->header.stamp);
+  // @brief: telephoto camera (two-view engines only). Its frames only ever
+  // fill view 1; a plan waiting for one of them runs from here
+  void OnFarImage(sensor_msgs::msg::CompressedImage::ConstSharedPtr msg) {
+    const cv::Mat frame = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
+    if (frame.empty()) return;
+    const double stamp_s = rclcpp::Time(msg->header.stamp).seconds();
+
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    window_->Push(1, frame, stamp_s);
+    TryPlan();
+  }
+
+  // @brief: run the pending plan if the window can be assembled for it.
+  // Called with plan_mutex_ held. A wide history that does not reach back
+  // 1.5 s yet is the warm-up; a telephoto slot with no frame within
+  // tolerance either waits (the newest slot, while that camera's stream has
+  // not passed the wide stamp + tolerance yet) or skips the inference
+  void TryPlan() {
+    if (!pending_) return;
+    const preprocess::ViewSelection sel = window_->Assemble(planner_->VideoInput());
+    if (!sel.ok) {
+      if (sel.failed_view == 0) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "warming up: %s",
+                             sel.reason.c_str());
+        pending_.reset();
+        return;
+      }
+      const double newest = window_->NewestStamp(sel.failed_view);
+      const bool may_still_arrive =
+          sel.failed_slot == model::planner::kNumHistFrames - 1 &&
+          (std::isnan(newest) || newest < pending_->stamp_s + view_tolerance_s_);
+      if (may_still_arrive) return;
+      Skip(sel.reason);
+      return;
+    }
+    if (sel.worst_view_offset_s > worst_view_offset_s_) worst_view_offset_s_ = sel.worst_view_offset_s;
+
+    // --- inference ---
+    const Pending job = *pending_;
+    pending_.reset();
+    const common::Trajectory plan = planner_->ForwardPrepared(job.ego.Encode());
+
+    const common::Trajectory &shown = Smoothed(plan, job.stamp);
+    PublishPlan(plan, job.stamp);
 
     // Drawing and encoding cost more than the inference does, and doing them
     // here used to block this callback long enough to drop camera frames --
@@ -235,13 +353,33 @@ class LatentDriveNode : public rclcpp::Node {
     // loop never waits. `frame` is a cv::Mat, so this shares rather than copies
     {
       std::lock_guard<std::mutex> lock(viz_mutex_);
-      viz_job_ = VizJob{frame, shown, ego};
+      viz_job_ = VizJob{job.frame, shown, job.ego};
     }
     viz_cv_.notify_one();
 
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-                         "planning: v=%.1f m/s  |4s|=%.1f m", std::hypot(ego.vel_x, ego.vel_y),
-                         std::hypot(plan.back().x, plan.back().y));
+    ++planned_;
+    if (num_views_ >= 2) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "planning: v=%.1f m/s  |4s|=%.1f m  (2 views, telephoto within %.0f ms, "
+                           "%zu planned / %zu skipped)",
+                           std::hypot(job.ego.vel_x, job.ego.vel_y),
+                           std::hypot(plan.back().x, plan.back().y), worst_view_offset_s_ * 1e3,
+                           planned_, skipped_);
+    } else {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "planning: v=%.1f m/s  |4s|=%.1f m", std::hypot(job.ego.vel_x, job.ego.vel_y),
+                           std::hypot(plan.back().x, plan.back().y));
+    }
+  }
+
+  // @brief: give up on the pending plan and say so. Every skipped inference
+  // is counted and reported; nothing stands in for the missing view
+  void Skip(const std::string &reason) {
+    ++skipped_;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "inference skipped (%zu so far, %zu planned): %s", skipped_, planned_,
+                         reason.c_str());
+    pending_.reset();
   }
 
   // @brief: the plan to draw. The smoother carries the previous one forward by
@@ -351,7 +489,24 @@ class LatentDriveNode : public rclcpp::Node {
   }
 
   std::shared_ptr<model::planner::Planner> planner_;
-  std::shared_ptr<preprocess::FrameWindow> window_;
+  std::shared_ptr<preprocess::ViewWindow> window_;
+  int num_views_ = 1;
+  std::string far_camera_topic_;
+  double view_tolerance_s_ = model::planner::kDefaultViewToleranceS;
+
+  // The wide frame waiting to be planned on (its ego state sampled with it),
+  // and the running tally the log lines report
+  struct Pending {
+    double stamp_s;
+    builtin_interfaces::msg::Time stamp;
+    cv::Mat frame;
+    common::EgoStatus ego;
+  };
+  std::optional<Pending> pending_;
+  std::mutex plan_mutex_;  // window_, pending_, planner_, smoother state, odom_, accel_
+  std::size_t planned_ = 0;
+  std::size_t skipped_ = 0;
+  double worst_view_offset_s_ = 0.0;
   std::shared_ptr<visualizer::BevVisualizer> bev_;
   std::shared_ptr<visualizer::CameraProjector> projector_;
   std::shared_ptr<visualizer::TrajectorySmoother> smoother_;
@@ -371,7 +526,10 @@ class LatentDriveNode : public rclcpp::Node {
   nav_msgs::msg::Odometry::ConstSharedPtr odom_;
   geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr accel_;
 
+  rclcpp::CallbackGroup::SharedPtr wide_group_;
+  rclcpp::CallbackGroup::SharedPtr far_group_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_img_;
+  rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr sub_far_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<geometry_msgs::msg::AccelWithCovarianceStamped>::SharedPtr sub_accel_;
   // One in-flight drawing job, latest wins
@@ -394,7 +552,12 @@ class LatentDriveNode : public rclcpp::Node {
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<LatentDriveNode>());
+  // Three threads: the two camera decodes side by side, one for everything
+  // else. The camera callback groups keep each stream in order
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  auto node = std::make_shared<LatentDriveNode>();
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }
