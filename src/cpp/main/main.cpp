@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -59,6 +60,18 @@ DEFINE_string(gt_name, "gt_target.npy",
 DEFINE_string(calibration_file, "",
               "Path to calibration.json (default: <package_dir>/calibration.json)");
 
+// Second camera source, consulted only when the engine takes two views
+DEFINE_string(far_clip_dir, "",
+              "Two-view engines: directory of the telephoto clip (frames/*.jpg + sequence.json "
+              "with per-frame t_us), frame-aligned to the wide clip by nearest timestamp. "
+              "Default: <clip dir>/far");
+DEFINE_double(view_tolerance_s, planner::kDefaultViewToleranceS,
+              "Two-view engines: largest |telephoto stamp - wide stamp| accepted per history "
+              "slot; a slot without such a frame skips that step (no substitute frame)");
+DEFINE_double(history_tolerance_s, planner::kDefaultHistoryToleranceS,
+              "Two-view engines: slack on the 1.5 s the wide history must span before a "
+              "step can run");
+
 // Output flags
 DEFINE_string(out_name, "engine_output.npy",
               "File name of the per-input outputs written next to the references");
@@ -107,25 +120,88 @@ static std::vector<fs::path> SortedDirs(const fs::path &parent) {
   return dirs;
 }
 
+// One camera stream of a clip as sequence.json lists it: frame number, stamp
+// and file name per frame, in time order
+struct FrameIndex {
+  std::vector<int>         frame;
+  std::vector<double>      t_s;
+  std::vector<std::string> file;
+};
+
+// @brief: This function is used to read the frames[] list of a clip's
+// sequence.json. `t_us` is the bag stamp; `file` falls back to the zero-padded
+// frame number, which is how the hand-off package names its JPEGs
+static FrameIndex LoadFrameIndex(const fs::path &clip_dir) {
+  std::ifstream json_file(clip_dir / "sequence.json");
+  if (!json_file) LOGF("Cannot open %s", (clip_dir / "sequence.json").c_str());
+  const auto sequence = nlohmann::json::parse(json_file);
+  FrameIndex index;
+  for (const auto &frame : sequence["frames"]) {
+    index.frame.push_back(frame["frame"].get<int>());
+    index.t_s.push_back(frame.value("t_us", 0L) * 1e-6);
+    if (frame.contains("file")) {
+      index.file.push_back(frame["file"].get<std::string>());
+    } else {
+      char name[16];
+      std::snprintf(name, sizeof(name), "%05d.jpg", index.frame.back());
+      index.file.push_back(name);
+    }
+  }
+  return index;
+}
+
 // @brief: This function is used to feed the whole frame list of one clip into
-// the sliding window step by step; the callback receives each step's plan
-// input already assembled. Shared by run-package (numeric check + benchmark)
-// and visualize (rendering), so the streaming logic exists exactly once
-template <typename StepFn>
+// the sliding window step by step; `on_step` receives each step's plan input
+// already assembled, `on_skip` the steps a two-view engine could not run.
+// Shared by run-package (numeric check + benchmark) and visualize (rendering),
+// so the streaming logic exists exactly once.
+//
+// A single-view engine streams the way the hand-off package defines it: every
+// frame in order through the count-based FrameWindow, whose stride matches the
+// package's history_frames. A two-view engine streams by timestamp instead
+// (planner_io.pick_history / build_video_views): the wide clip anchors the
+// four slots, the telephoto clip -- a second sensor's frames, from
+// <clip>/far or --far_clip_dir -- supplies the frame nearest each chosen wide
+// stamp within --view_tolerance_s, and a step without one is skipped rather
+// than filled with a substitute frame
+template <typename StepFn, typename SkipFn>
 static void StreamClip(const fs::path &clip_dir, model::planner::Planner &planner,
                        preprocess::FrameWindow &window, timer::Timer &timer,
-                       StepFn on_step) {
+                       StepFn on_step, SkipFn on_skip) {
   std::ifstream json_file(clip_dir / "sequence.json");
   const auto    sequence   = nlohmann::json::parse(json_file);
   const auto    status_all = utils::LoadNpy((clip_dir / "status.npy").string());
+  const auto   &steps      = sequence["steps"];
 
-  std::vector<int> frame_numbers;
-  for (const auto &frame : sequence["frames"]) {
-    frame_numbers.push_back(frame["frame"].get<int>());
+  const FrameIndex wide = LoadFrameIndex(clip_dir);
+
+  // --- two-view: the telephoto clip and the timestamped window -----------
+  const int                               num_views = planner.NumViews();
+  FrameIndex                              far;
+  fs::path                                far_dir;
+  std::shared_ptr<preprocess::ViewWindow> views;
+  if (num_views >= 2) {
+    if (num_views > 2) {
+      LOGF("Engine takes %d views; this tool has sources for two (wide + telephoto)", num_views);
+    }
+    far_dir = FLAGS_far_clip_dir.empty() ? clip_dir / "far" : fs::path(FLAGS_far_clip_dir);
+    if (!fs::exists(far_dir / "sequence.json")) {
+      LOGF("Two-view engine, but no telephoto clip at %s (frames/*.jpg + sequence.json with "
+           "t_us). Point --far_clip_dir at it; the far view is never substituted",
+           far_dir.c_str());
+    }
+    far = LoadFrameIndex(far_dir);
+    preprocess::ViewWindowParams params;
+    params.num_views           = num_views;
+    params.view_tolerance_s    = FLAGS_view_tolerance_s;
+    params.history_tolerance_s = FLAGS_history_tolerance_s;
+    views                      = preprocess::CreateViewWindow(params);
+    if (!views) LOGF("Cannot create the two-view window");
+    LOG("  two-view stream: wide %zu frames, telephoto %zu frames from %s (tolerance %.0f ms)",
+        wide.frame.size(), far.frame.size(), far_dir.c_str(), FLAGS_view_tolerance_s * 1e3);
   }
 
-  const auto &steps      = sequence["steps"];
-  std::size_t next_frame = 0;
+  std::size_t next_wide = 0, next_far = 0;
   cv::Mat     camera;
 
   window.Reset();
@@ -133,14 +209,34 @@ static void StreamClip(const fs::path &clip_dir, model::planner::Planner &planne
     const int step_frame = steps[k]["frame"].get<int>();
 
     timer.StartCpu();
-    while (next_frame < frame_numbers.size() && frame_numbers[next_frame] <= step_frame) {
-      char name[16];
-      std::snprintf(name, sizeof(name), "%05d.jpg", frame_numbers[next_frame]);
-      camera = cv::imread((clip_dir / "frames" / name).string(), cv::IMREAD_COLOR);
-      window.Push(camera);
-      ++next_frame;
+    while (next_wide < wide.frame.size() && wide.frame[next_wide] <= step_frame) {
+      camera = cv::imread((clip_dir / "frames" / wide.file[next_wide]).string(), cv::IMREAD_COLOR);
+      if (views) {
+        views->Push(0, camera, wide.t_s[next_wide]);
+      } else {
+        window.Push(camera);
+      }
+      ++next_wide;
     }
-    window.Assemble(planner.VideoInput());
+    if (views) {
+      // Offline every telephoto frame is at hand, so unlike the live node
+      // nothing waits: any far frame up to the tolerance past the wide stamp
+      // is a candidate for this step
+      const double t_step = views->NewestStamp(0);
+      while (next_far < far.frame.size() && far.t_s[next_far] <= t_step + FLAGS_view_tolerance_s) {
+        views->Push(1, cv::imread((far_dir / "frames" / far.file[next_far]).string(), cv::IMREAD_COLOR),
+                    far.t_s[next_far]);
+        ++next_far;
+      }
+      const preprocess::ViewSelection sel = views->Assemble(planner.VideoInput());
+      if (!sel.ok) {
+        timer.StopCpu("preprocess");
+        on_skip(k, sel.reason);
+        continue;
+      }
+    } else {
+      window.Assemble(planner.VideoInput());
+    }
     timer.StopCpu("preprocess");
 
     std::array<float, planner::kStatusDim> status;
@@ -158,7 +254,7 @@ static void StreamClip(const fs::path &clip_dir, model::planner::Planner &planne
 // @brief: This function is used to warm the engine up so cuda runtime
 // initialization does not pollute the first timed samples
 static void Warmup(model::planner::Planner &planner) {
-  const std::vector<float>                     zeros(planner::kVideoNumel, 0.f);
+  const std::vector<float>                     zeros(planner.VideoNumel(), 0.f);
   const std::array<float, planner::kStatusDim> status{};
   for (int i = 0; i < 10; ++i) {
     planner.Forward(zeros.data(), status);
@@ -212,6 +308,16 @@ static int RunPackage() {
   for (const auto &sample_dir : SortedDirs(package / "samples")) {
     const auto video  = utils::LoadNpy((sample_dir / "video.npy").string());
     const auto status = utils::LoadNpy((sample_dir / "status.npy").string());
+
+    // A packaged video.npy is one complete input: [3,4,H,W] for a single-view
+    // engine, [V,3,4,H,W] for a multi-view one. Feeding the wrong one would
+    // read past the array
+    if (video.Numel() != planner_ptr->VideoNumel()) {
+      LOG("  %-32s (video.npy has %zu floats, the %d-view engine wants %zu -- skipped)",
+          sample_dir.filename().c_str(), video.Numel(), planner_ptr->NumViews(),
+          planner_ptr->VideoNumel());
+      continue;
+    }
 
     std::array<float, planner::kStatusDim> status_arr;
     std::copy_n(status.data.begin(), planner::kStatusDim, status_arr.begin());
@@ -268,6 +374,14 @@ static int RunPackage() {
 
     timer::Timer       timer;
     std::vector<float> plans;
+    std::size_t        skipped = 0;
+    // Keep the row so the output stays step-aligned with the reference; NaN
+    // marks a step the two-view engine did not run
+    const auto on_skip = [&](std::size_t k, const std::string &reason) {
+      LOGW("  step %zu skipped: %s", k, reason.c_str());
+      plans.insert(plans.end(), row_numel, std::numeric_limits<float>::quiet_NaN());
+      ++skipped;
+    };
     StreamClip(clip_dir, *planner_ptr, *window_ptr, timer,
                [&](std::size_t k, const nlohmann::json &,
                    const std::array<float, planner::kStatusDim> &,
@@ -276,7 +390,11 @@ static int RunPackage() {
                  // The first steps carry the window pre-fill (16 decodes) and
                  // engine warmup transients; benchmark steps 5..n only
                  if (k == 4) timer.Reset();
-               });
+               }, on_skip);
+    if (skipped > 0) {
+      LOGW("  %-16s %zu step(s) skipped (no telephoto frame within tolerance)",
+           clip_dir.filename().c_str(), skipped);
+    }
 
     const std::size_t n_steps = plans.size() / row_numel;
     utils::SaveNpy((clip_dir / FLAGS_out_name).string(), plans.data(),
@@ -289,6 +407,7 @@ static int RunPackage() {
       if (ref.shape.size() == 3 && ref.shape[1] == num_waypoints) {
         double worst = 0;
         for (std::size_t k = 0; k < n_steps; ++k) {
+          if (std::isnan(plans[k * row_numel])) continue;  // skipped step
           worst = std::max(worst,
                            MaxXyError(RowToTrajectory(plans.data() + k * row_numel, num_waypoints),
                                       ref.data.data() + k * row_numel));
@@ -511,6 +630,12 @@ static int Visualize() {
   const cv::Scalar kInk{225, 225, 225};  // near-white value text
   const cv::Scalar kSeparator{45, 47, 47};
 
+  // No plan, no frame: a skipped step leaves a gap in the video rather than
+  // drawing a stale or invented plan
+  const auto on_skip = [&](std::size_t k, const std::string &reason) {
+    LOGW("step %zu skipped: %s", k, reason.c_str());
+  };
+
   StreamClip(clip_dir, *planner_ptr, *window_ptr, timer,
              [&](std::size_t k, const nlohmann::json &step,
                  const std::array<float, planner::kStatusDim> &status,
@@ -572,7 +697,8 @@ static int Visualize() {
                std::vector<cv::Scalar>                 cols;
                // `phase` is optional -- the newer whole-scene exports drop it
                rows.push_back({"LatentDrive",
-                               cv::format("TRT fp16  %s  %zu/%d  %s", FLAGS_clip.c_str(), k,
+                               cv::format("TRT fp16 %dv  %s  %zu/%d  %s", planner_ptr->NumViews(),
+                                          FLAGS_clip.c_str(), k,
                                           sequence["n_steps"].get<int>() - 1,
                                           step.value("phase", std::string()).c_str())});
                cols.push_back(kInk);
@@ -668,7 +794,7 @@ static int Visualize() {
                                  cv::format("_step%04zu.png", k),
                              frame);
                }
-             });
+             }, on_skip);
 
   if (use_video) writer.release();
   LOG("Wrote %s", use_video ? out_video.c_str() : png_dir.c_str());
@@ -695,7 +821,9 @@ int main(int argc, char *argv[]) {
       "LatentDrive e2e planner TensorRT tools\n"
       "  --mode=build-engine --onnx_file=O   --engine_file=E       ONNX -> engine\n"
       "  --mode=run-package  --engine_file=E --package_dir=DIR     validate + benchmark\n"
-      "  --mode=visualize    --engine_file=E --package_dir=DIR     camera overlay + BEV video");
+      "  --mode=visualize    --engine_file=E --package_dir=DIR     camera overlay + BEV video\n"
+      "A two-view engine (6-D video input) also reads the telephoto clip from <clip>/far\n"
+      "or --far_clip_dir; --view_tolerance_s bounds the wide/telephoto stamp mismatch");
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   if (FLAGS_engine_file.empty()) {
