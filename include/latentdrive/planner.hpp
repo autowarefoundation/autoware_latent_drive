@@ -2,6 +2,7 @@
 #define __PLANNER_HPP__
 
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -20,21 +21,29 @@ class Planner {
   Planner()          = default;
   virtual ~Planner() = default;
 
-  // @brief: Run one plan. `in_video` is the [3, 4, 256, 512] normalized CHW
-  // window (oldest..newest), copied into the pinned input buffer before the
-  // H2D -> enqueueV3 -> D2H round trip (synchronized on return)
+  // @brief: Run one plan. `in_video` is the normalized CHW window
+  // (oldest..newest) of every view the engine takes, laid out as NumViews()
+  // contiguous [3, 4, 256, 512] blocks (view 0 first) -- VideoNumel() floats.
+  // It is copied into the pinned input buffer before the H2D -> enqueueV3 ->
+  // D2H round trip (synchronized on return)
   virtual common::Trajectory Forward(const float                         *in_video,
                                      const std::array<float, kStatusDim> &in_status) = 0;
 
   // @brief: Zero-copy path. Write the window straight into the pinned buffer
-  // returned by `VideoInput` (e.g. FrameWindow::Assemble(planner->VideoInput()))
-  // and call `ForwardPrepared`, saving one 6 MB host memcpy per step
+  // returned by `VideoInput` (e.g. window->Assemble(planner->VideoInput()))
+  // and call `ForwardPrepared`, saving one 6 MB-per-view host memcpy per step
   virtual float             *VideoInput()                                                    = 0;
   virtual common::Trajectory ForwardPrepared(const std::array<float, kStatusDim> &in_status) = 0;
 
   // @brief: Waypoint count of the loaded engine ([1, N, 3] output): 8 for the
   // 2 Hz checkpoints, 40 for the 10 Hz ones. The horizon is 4 s either way
   virtual int NumWaypoints() const = 0;
+
+  // @brief: Camera views the loaded engine takes: 1 for a 5-D `video` input,
+  // V for a 6-D [1, V, 3, 4, H, W] one (view 0 = wide front, view 1 =
+  // telephoto). VideoNumel() is the float count of one complete input
+  virtual int         NumViews() const   = 0;
+  virtual std::size_t VideoNumel() const = 0;
 };
 
 // @brief: This function is used as a factory to deserialize the engine and
