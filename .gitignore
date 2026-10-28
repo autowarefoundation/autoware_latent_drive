@@ -1,5 +1,5 @@
 build*/
-sample_data/
+/sample_data/
 models/
 *.engine
 *.onnx
