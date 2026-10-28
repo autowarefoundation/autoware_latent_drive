@@ -1,0 +1,4 @@
+BasedOnStyle: Google # 或者 LLVM, Mozilla, Chromium, WebKit 等
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+ColumnLimit: 0

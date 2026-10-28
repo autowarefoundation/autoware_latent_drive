@@ -1,0 +1,57 @@
+#ifndef __PLANNER_PARAMS_HPP__
+#define __PLANNER_PARAMS_HPP__
+
+#include "trajectory.hpp"
+
+namespace model {
+namespace planner {
+
+/****************************************/
+/***********Network related**************/
+/****************************************/
+// The engine is exported with fixed shapes (batch 1, single camera stream):
+//   video  float32 [1, 3, 4, 256, 512]
+//   status float32 [1, 6]
+//   traj   float32 [1, 8, 3]
+constexpr static char kVideoTensorName[]  = "video";
+constexpr static char kStatusTensorName[] = "status";
+constexpr static char kTrajTensorName[]   = "traj";
+
+constexpr static int kInputHeight   = 256;
+constexpr static int kInputWidth    = 512;
+constexpr static int kNumHistFrames = 4;  // video slots, oldest..newest, 0.5 s apart
+constexpr static int kStatusDim     = 6;
+
+constexpr static int kFrameNumel = 3 * kInputHeight * kInputWidth;  // one CHW frame
+constexpr static int kVideoNumel = kFrameNumel * kNumHistFrames;    // [3, 4, H, W]
+
+// The output is [1, N, 3] with N read from the engine at load time -- the
+// waypoint count differs between checkpoints (8 at 2 Hz, 40 at 10 Hz)
+
+/****************************************/
+/**********Preprocess related************/
+/****************************************/
+// Camera frames run at 10 Hz but the video slots are 0.5 s apart, so
+// consecutive slots are kFrameStride camera frames apart
+constexpr static int kFrameStride = 5;
+
+constexpr static float kImageNetMean[3] = {0.485f, 0.456f, 0.406f};
+constexpr static float kImageNetStd[3]  = {0.229f, 0.224f, 0.225f};
+
+/****************************************/
+/*********Engine build related***********/
+/****************************************/
+// Layers pinned to fp32 in the fp16 build (the validated mixed-precision
+// recipe). Prefixes match the ONNX node scopes of the planner stage --
+// 713 of 11409 nodes, negligible compute next to the ViT encoder
+constexpr static const char *kFp32LayerPrefixes[] = {
+    "/planner/transformer/",
+    "/planner/trajectory_head/",
+    "/planner/image_fc/",
+    "/planner/status_encoding/",
+};
+
+}  // namespace planner
+}  // namespace model
+
+#endif  //__PLANNER_PARAMS_HPP__
