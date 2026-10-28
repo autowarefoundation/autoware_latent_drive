@@ -1,0 +1,8 @@
+# ros2 bag play --qos-profile-overrides-path: /tf_static must be played latched
+# (transient local) or a TF listener that starts after the first message never
+# sees the camera extrinsics. Readable by both humble and jazzy, whichever QoS
+# the bag's metadata.yaml carries (or not)
+/tf_static:
+  history: keep_all
+  reliability: reliable
+  durability: transient_local
