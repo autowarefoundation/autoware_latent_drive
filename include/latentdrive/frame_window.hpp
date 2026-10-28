@@ -5,6 +5,7 @@
 #include <memory>
 #include <opencv2/core.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "planner_params.hpp"
@@ -74,6 +75,12 @@ struct ViewWindowParams {
   double history_tolerance_s = model::planner::kDefaultHistoryToleranceS;
   // Per slot, how far a non-wide view's frame may be from the wide frame
   double view_tolerance_s = model::planner::kDefaultViewToleranceS;
+  // What a slot without such a frame gets. false: the selection fails and the
+  // caller skips the inference. true: the slot is filled with the image the
+  // camfront3 training fed for a missing side view -- all zeros before
+  // normalization, i.e. -mean/std per channel -- and the selection lists it
+  // in `filled`. View 0 is never filled: without it there is no "now"
+  bool fill_missing_views = false;
   // Frames older than the view's newest stamp minus this are dropped; the
   // history reaches 1.5 s back, the rest is slack for the tolerances
   double retain_s = 2.5;
@@ -95,6 +102,9 @@ struct ViewSelection {
   // largest |view stamp - wide stamp|, for diagnostics
   double worst_history_offset_s = 0.0;
   double worst_view_offset_s    = 0.0;
+  // (view, slot) pairs filled with the blank frame (fill_missing_views only);
+  // their stamps_s entries stay NaN
+  std::vector<std::pair<int, int>> filled;
 };
 
 // @brief `ViewWindow` class is a interface class for the timestamped window
@@ -102,9 +112,10 @@ struct ViewSelection {
 // history: its newest frame is "now" and its four slots are picked by nearest
 // stamp (PickHistory). Every other view then supplies the frame nearest in
 // time to each chosen wide frame, within `view_tolerance_s`; a slot with no
-// such frame fails the whole selection -- a grey, black or duplicated frame
-// is never substituted, the caller skips that inference instead. Frames are
-// preprocessed once, on `Push`; `Assemble` only copies
+// such frame fails the whole selection (the caller skips that inference) or,
+// with fill_missing_views, gets the training's blank frame; a duplicated or
+// stale frame is never substituted. Frames are preprocessed once, on `Push`;
+// `Assemble` only copies
 class ViewWindow {
  public:
   ViewWindow()          = default;
@@ -114,6 +125,11 @@ class ViewWindow {
   // (seconds, any epoch shared by all views) and add it. A stamp that jumps
   // back by more than `retain_s` (a looping bag) empties that view first
   virtual void Push(int view, const cv::Mat &in_frame, double stamp_s, bool in_is_rgb = false) = 0;
+
+  // @brief: The same for a frame already run through PreprocessFrame
+  // (kFrameNumel floats). A multi-threaded caller preprocesses outside its
+  // lock and only holds it for this push
+  virtual void PushPreprocessed(int view, std::vector<float> &&in_chw, double stamp_s) = 0;
 
   // @brief: Choose the frames for the newest wide frame without copying
   virtual ViewSelection Select() const = 0;

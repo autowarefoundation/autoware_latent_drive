@@ -97,12 +97,16 @@ class PlannerImpl : public Planner {
            DimsToString(video_dims).c_str(), kNumHistFrames, kInputHeight, kInputWidth);
       return false;
     }
+    // status is [1, 2K + 4]: K route points (one = the 50 m subgoal) and the
+    // four motion terms. K is a property of the checkpoint, like V and N
     nvinfer1::Dims status_dims = engine_->getTensorShape(kStatusTensorName);
-    if (status_dims.nbDims != 2 || status_dims.d[1] != kStatusDim) {
-      LOGE("Unexpected status shape %s (want [1, %d])", DimsToString(status_dims).c_str(),
-           kStatusDim);
+    if (status_dims.nbDims != 2 || status_dims.d[1] < kLegacyStatusDim ||
+        (status_dims.d[1] - kStatusMotionDim) % 2 != 0) {
+      LOGE("Unexpected status shape %s (want [1, 2K + %d], K >= 1)",
+           DimsToString(status_dims).c_str(), kStatusMotionDim);
       return false;
     }
+    status_dim_ = static_cast<int>(status_dims.d[1]);
 
     // An engine built from an export with a symbolic batch axis reports -1
     // there; the build froze its profile at batch 1, and the context needs
@@ -151,38 +155,43 @@ class PlannerImpl : public Planner {
 
     const std::size_t traj_bytes = static_cast<std::size_t>(num_waypoints_) * 3 * sizeof(float);
     host_video_                  = common::cuda::MakeHostMemory<float>(video_numel_ * sizeof(float));
-    host_status_                 = common::cuda::MakeHostMemory<float>(kStatusDim * sizeof(float));
+    host_status_                 = common::cuda::MakeHostMemory<float>(status_dim_ * sizeof(float));
     host_traj_                   = common::cuda::MakeHostMemory<float>(traj_bytes);
     dev_video_                   = common::cuda::MakeDeviceMemory<float>(video_numel_ * sizeof(float));
-    dev_status_                  = common::cuda::MakeDeviceMemory<float>(kStatusDim * sizeof(float));
+    dev_status_                  = common::cuda::MakeDeviceMemory<float>(status_dim_ * sizeof(float));
     dev_traj_                    = common::cuda::MakeDeviceMemory<float>(traj_bytes);
 
     context_->setTensorAddress(kVideoTensorName, dev_video_.get());
     context_->setTensorAddress(kStatusTensorName, dev_status_.get());
     context_->setTensorAddress(output_name_.c_str(), dev_traj_.get());
 
-    LOG("Deserialized %s (%d view%s, %d waypoints, output '%s')", engine_path.c_str(),
-        num_views_, num_views_ == 1 ? "" : "s", num_waypoints_, output_name_.c_str());
+    LOG("Deserialized %s (%d view%s, status [1, %d] = %d route point%s, %d waypoints, output '%s')",
+        engine_path.c_str(), num_views_, num_views_ == 1 ? "" : "s", status_dim_, NumRoutePoints(),
+        NumRoutePoints() == 1 ? "" : "s", num_waypoints_, output_name_.c_str());
     return true;
   }
 
-  common::Trajectory Forward(const float                         *in_video,
-                             const std::array<float, kStatusDim> &in_status) final {
+  common::Trajectory Forward(const float *in_video, const std::vector<float> &in_status) final {
     std::memcpy(host_video_.get(), in_video, video_numel_ * sizeof(float));
     return ForwardPrepared(in_status);
   }
 
   float *VideoInput() final { return host_video_.get(); }
 
-  common::Trajectory ForwardPrepared(const std::array<float, kStatusDim> &in_status) final {
-    std::memcpy(host_status_.get(), in_status.data(), kStatusDim * sizeof(float));
+  common::Trajectory ForwardPrepared(const std::vector<float> &in_status) final {
+    if (static_cast<int>(in_status.size()) != status_dim_) {
+      LOGE("status has %zu values, the engine takes %d (%d route points + %d motion terms)",
+           in_status.size(), status_dim_, NumRoutePoints(), kStatusMotionDim);
+      return {};
+    }
+    std::memcpy(host_status_.get(), in_status.data(), status_dim_ * sizeof(float));
 
     const std::size_t traj_bytes = static_cast<std::size_t>(num_waypoints_) * 3 * sizeof(float);
     CUDA_CHECK(cudaMemcpyAsync(dev_video_.get(), host_video_.get(),
                                video_numel_ * sizeof(float),
                                cudaMemcpyHostToDevice, stream_));
     CUDA_CHECK(cudaMemcpyAsync(dev_status_.get(), host_status_.get(),
-                               kStatusDim * sizeof(float),
+                               status_dim_ * sizeof(float),
                                cudaMemcpyHostToDevice, stream_));
     if (!context_->enqueueV3(stream_)) {
       LOGF("enqueueV3 failed");
@@ -200,11 +209,14 @@ class PlannerImpl : public Planner {
   int         NumWaypoints() const final { return num_waypoints_; }
   int         NumViews() const final { return num_views_; }
   std::size_t VideoNumel() const final { return video_numel_; }
+  int         StatusDim() const final { return status_dim_; }
+  int         NumRoutePoints() const final { return (status_dim_ - kStatusMotionDim) / 2; }
 
  private:
   cudaStream_t stream_        = nullptr;
   int          num_waypoints_ = 0;
   int          num_views_     = 0;
+  int          status_dim_    = 0;
   std::size_t  video_numel_   = 0;
   std::string  output_name_;
 

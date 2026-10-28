@@ -285,8 +285,50 @@ static void TestCropBand() {
   CHECK_NEAR(chw2[0], Normalized(255, 0), 1e-5);
 }
 
+// The camfront3 contract: front + front_left + front_right, the side cameras
+// 14 ms either side of the front. A right camera that drops its newest frame
+// fails the selection by default and gets the training's blank frame with
+// fill_missing_views
+static void TestThreeViewFill() {
+  for (const bool fill : {false, true}) {
+    preprocess::ViewWindowParams params;
+    params.num_views          = 3;
+    params.fill_missing_views = fill;
+    auto window               = preprocess::CreateViewWindow(params);
+    CHECK(window != nullptr);
+    const auto front = Stamps10Hz(16);
+    const auto left  = Stamps10Hz(16, -0.014);
+    const auto right = Stamps10Hz(15, 0.014);  // the newest right frame never came
+    for (int i = 0; i < 16; ++i) {
+      window->Push(0, Solid(10, 20, 30), front[i]);
+      window->Push(1, Solid(40, 50, 60), left[i]);
+      if (i < 15) window->Push(2, Solid(70, 80, 90), right[i]);
+    }
+    std::vector<float> video(3 * kVideoNumel, 12345.f);
+    const auto         sel = window->Assemble(video.data());
+    if (!fill) {
+      CHECK(!sel.ok);
+      CHECK(sel.failed_view == 2 && sel.failed_slot == kNumHistFrames - 1);
+      continue;
+    }
+    CHECK(sel.ok);
+    CHECK(sel.filled.size() == 1 && sel.filled[0].first == 2 && sel.filled[0].second == kNumHistFrames - 1);
+    CHECK_NEAR(sel.worst_view_offset_s, 0.014, 1e-6);
+    const std::size_t plane = static_cast<std::size_t>(kInputHeight) * kInputWidth;
+    for (int c = 0; c < 3; ++c) {
+      // view 2, newest slot: zeros before normalization
+      const std::size_t blank = ((2 * 3 + c) * kNumHistFrames + (kNumHistFrames - 1)) * plane;
+      CHECK_NEAR(video[blank], Normalized(0, c), 1e-5);
+      // view 2, the slot before it is a real frame (BGR 70, 80, 90 -> RGB 90, 80, 70)
+      const std::size_t real = ((2 * 3 + c) * kNumHistFrames + (kNumHistFrames - 2)) * plane;
+      CHECK_NEAR(video[real], Normalized(90 - 10 * c, c), 1e-5);
+    }
+  }
+}
+
 int main() {
   TestPickHistory();
+  TestThreeViewFill();
   TestNearestWithin();
   TestTwoViewAlignmentAndLayout();
   TestSingleViewWindow();

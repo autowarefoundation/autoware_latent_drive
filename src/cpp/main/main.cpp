@@ -175,6 +175,14 @@ static void StreamClip(const fs::path &clip_dir, model::planner::Planner &planne
 
   const FrameIndex wide = LoadFrameIndex(clip_dir);
 
+  // status.npy rows are the encoded status of each step, [n_steps, 2K + 4];
+  // a clip prepared for another contract (K = 1 vs 6) cannot feed this engine
+  const std::size_t status_dim = static_cast<std::size_t>(planner.StatusDim());
+  if (status_all.shape.size() != 2 || status_all.shape[1] != status_dim) {
+    LOGF("%s/status.npy has rows of %zu values, the engine takes status [1, %zu]", clip_dir.c_str(),
+         status_all.shape.size() == 2 ? status_all.shape[1] : 0, status_dim);
+  }
+
   // --- two-view: the telephoto clip and the timestamped window -----------
   const int                               num_views = planner.NumViews();
   FrameIndex                              far;
@@ -239,9 +247,8 @@ static void StreamClip(const fs::path &clip_dir, model::planner::Planner &planne
     }
     timer.StopCpu("preprocess");
 
-    std::array<float, planner::kStatusDim> status;
-    std::copy_n(status_all.data.begin() + k * planner::kStatusDim,
-                planner::kStatusDim, status.begin());
+    const std::vector<float> status(status_all.data.begin() + k * status_dim,
+                                    status_all.data.begin() + (k + 1) * status_dim);
 
     timer.StartCpu();
     const common::Trajectory pred = planner.ForwardPrepared(status);
@@ -254,8 +261,8 @@ static void StreamClip(const fs::path &clip_dir, model::planner::Planner &planne
 // @brief: This function is used to warm the engine up so cuda runtime
 // initialization does not pollute the first timed samples
 static void Warmup(model::planner::Planner &planner) {
-  const std::vector<float>                     zeros(planner.VideoNumel(), 0.f);
-  const std::array<float, planner::kStatusDim> status{};
+  const std::vector<float> zeros(planner.VideoNumel(), 0.f);
+  const std::vector<float> status(static_cast<std::size_t>(planner.StatusDim()), 0.f);
   for (int i = 0; i < 10; ++i) {
     planner.Forward(zeros.data(), status);
   }
@@ -319,10 +326,12 @@ static int RunPackage() {
       continue;
     }
 
-    std::array<float, planner::kStatusDim> status_arr;
-    std::copy_n(status.data.begin(), planner::kStatusDim, status_arr.begin());
-
-    const common::Trajectory traj = planner_ptr->Forward(video.data.data(), status_arr);
+    if (status.Numel() != static_cast<std::size_t>(planner_ptr->StatusDim())) {
+      LOG("  %-32s (status.npy has %zu values, the engine takes %d -- skipped)",
+          sample_dir.filename().c_str(), status.Numel(), planner_ptr->StatusDim());
+      continue;
+    }
+    const common::Trajectory traj = planner_ptr->Forward(video.data.data(), status.data);
     utils::SaveNpy((sample_dir / FLAGS_out_name).string(), &traj[0].x,
                    {num_waypoints, 3});
 
@@ -384,8 +393,7 @@ static int RunPackage() {
     };
     StreamClip(clip_dir, *planner_ptr, *window_ptr, timer,
                [&](std::size_t k, const nlohmann::json &,
-                   const std::array<float, planner::kStatusDim> &,
-                   const common::Trajectory &pred, const cv::Mat &) {
+                   const std::vector<float> &, const common::Trajectory &pred, const cv::Mat &) {
                  plans.insert(plans.end(), &pred[0].x, &pred[0].x + row_numel);
                  // The first steps carry the window pre-fill (16 decodes) and
                  // engine warmup transients; benchmark steps 5..n only
@@ -576,8 +584,9 @@ static int Visualize() {
   // single frame is rendered, so the band's geometry is fixed up front and
   // only the playhead moves
   const auto        status_all = utils::LoadNpy((clip_dir / "status.npy").string());
+  const int         status_dim = planner_ptr->StatusDim();
   const std::size_t n_steps    = std::min<std::size_t>(sequence["steps"].size(),
-                                                       status_all.data.size() / planner::kStatusDim);
+                                                       status_all.data.size() / static_cast<std::size_t>(status_dim));
 
   std::map<int, visualizer::MapPose> frame_pose;
   for (const auto &f : sequence["frames"]) {
@@ -590,10 +599,10 @@ static int Visualize() {
   std::vector<cv::Point2d>         subgoals_ego;
   double                           speed_max = 1.0;
   for (std::size_t k = 0; k < n_steps; ++k) {
-    const float *st = status_all.data.data() + k * planner::kStatusDim;
+    const common::EgoStatus st = common::EgoStatus::Decode(status_all.data.data() + k * status_dim, status_dim);
     poses.push_back(frame_pose[sequence["steps"][k]["frame"].get<int>()]);
-    subgoals_ego.emplace_back(st[0] * 10.0, st[1] * 10.0);
-    speed_max = std::max(speed_max, static_cast<double>(std::hypot(st[2], st[3])));
+    subgoals_ego.emplace_back(st.Subgoal().x_m, st.Subgoal().y_m);
+    speed_max = std::max(speed_max, static_cast<double>(std::hypot(st.vel_x, st.vel_y)));
   }
 
   auto route_ptr = visualizer::CreateRouteMap(poses, subgoals_ego);
@@ -638,8 +647,10 @@ static int Visualize() {
 
   StreamClip(clip_dir, *planner_ptr, *window_ptr, timer,
              [&](std::size_t k, const nlohmann::json &step,
-                 const std::array<float, planner::kStatusDim> &status,
-                 const common::Trajectory &pred, const cv::Mat &camera_in) {
+                 const std::vector<float> &status_vec, const common::Trajectory &pred,
+                 const cv::Mat &camera_in) {
+               const common::EgoStatus status =
+                   common::EgoStatus::Decode(status_vec.data(), static_cast<int>(status_vec.size()));
                const std::size_t row_numel = num_waypoints * 3;
 
                // Step period straight from the clip; the smoother needs it to
@@ -671,13 +682,14 @@ static int Visualize() {
                                          visualizer::color::kGroundTruth, 1);
                }
                bev_ptr->DrawTrajectoryHorizon(shown, 2);
-               bev_ptr->DrawSubgoal(status[0] * 10.f, status[1] * 10.f);
-               bev_ptr->DrawVelocity(status[2], status[3]);
+               for (const common::RoutePoint &p : status.route_points) bev_ptr->DrawSubgoal(p.x_m, p.y_m);
+               bev_ptr->DrawVelocity(status.vel_x, status.vel_y);
                // the plan itself is drawn as a green(now)->red(+4s) gradient;
                // the legend swatch takes the near/now end
                bev_ptr->AddLegend("plan now->+4s", visualizer::HorizonColor(0.0));
                bev_ptr->AddLegend("ground truth", visualizer::color::kGroundTruth);
-               bev_ptr->AddLegend("subgoal 50m", visualizer::color::kSubgoal);
+               bev_ptr->AddLegend(status.route_points.size() == 1 ? "subgoal 50m" : "route points",
+                                  visualizer::color::kSubgoal);
                const cv::Mat &bev = bev_ptr->Image();
                cv::Mat        bev_panel;
                cv::resize(bev, bev_panel,
@@ -690,7 +702,7 @@ static int Visualize() {
                const double plan_ms   = engine_ms + pre_ms;
                const double med_ms    = timer.Percentile("enqueue", 50) +
                                      timer.Percentile("preprocess", 50);
-               const float speed = std::hypot(status[2], status[3]);
+               const float speed = std::hypot(status.vel_x, status.vel_y);
                const float wp_4s = std::hypot(pred.back().x, pred.back().y);
 
                std::vector<std::array<std::string, 2>> rows;
@@ -758,7 +770,7 @@ static int Visualize() {
                  route_ptr->Draw({kMapW, band_h}, k)
                      .copyTo(frame(cv::Rect(0, band_y, kMapW, band_h)));
                  cv::Mat ledger = frame(cv::Rect(kMapW + 2, band_y, kLedgerW, band_h));
-                 DrawRouteLedger(ledger, *route_ptr, k, std::hypot(status[0] * 10.f, status[1] * 10.f));
+                 DrawRouteLedger(ledger, *route_ptr, k, std::hypot(status.Subgoal().x_m, status.Subgoal().y_m));
                  speed_strip_ptr->Draw({strips_w, strip_h})
                      .copyTo(frame(cv::Rect(strips_x, band_y, strips_w, strip_h)));
                  if (plan_strip_ptr) {
