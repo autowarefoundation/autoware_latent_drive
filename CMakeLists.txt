@@ -137,18 +137,21 @@ set_target_properties(
 # ==============================================================================
 # Unit tests (ctest)
 # ==============================================================================
-# Plain-assert tests of the preprocessing window: history picked by nearest
-# stamp, cross-view alignment within tolerance, the [V, 3, T, H, W] layout.
+# Plain-assert tests of the preprocessing window (history picked by nearest
+# stamp, cross-view alignment within tolerance, the [V, 3, T, H, W] layout,
+# the blank fill) and of the status builder (route points, motion terms).
 # They need no GPU; `ctest --test-dir build` runs them after the build
 option(BUILD_TESTING "Build the unit tests" ON)
 if(BUILD_TESTING)
   enable_testing()
   file(GLOB TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+  # One executable and one ctest entry per test file
   foreach(CXX_FILE ${TEST_SRC})
     set_source_files_properties(${CXX_FILE} PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
+    get_filename_component(TEST_NAME ${CXX_FILE} NAME_WE)
+    add_executable(${TEST_NAME} ${CXX_FILE})
+    target_link_libraries(${TEST_NAME} PRIVATE latentdrive)
+    set_target_properties(${TEST_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
   endforeach()
-  add_executable(latentdrive-tests ${TEST_SRC})
-  target_link_libraries(latentdrive-tests PRIVATE latentdrive)
-  set_target_properties(latentdrive-tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-  add_test(NAME view_window COMMAND latentdrive-tests)
 endif()

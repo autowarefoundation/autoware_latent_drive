@@ -29,25 +29,29 @@ bool PreprocessFrame(const cv::Mat &in_frame, float *out_chw, bool in_is_rgb) {
     return false;
   }
 
+  // Vehicle preprocessing (planner_io.preprocess_frame): keep the full width,
+  // center-crop the rows to a 2:1 band, then resize to the model input. Every
+  // camera goes through this; a side or telephoto frame is a separate
+  // sensor's full frame, not a crop of the front one. On the hand-off package
+  // the JPEGs are already 512x256, so both steps are no-ops there. The colour
+  // swap comes last: bilinear resizing treats the channels independently, so
+  // swapping on the 512x256 result gives the same numbers as swapping the
+  // 2880x1860 frame first, at a fortieth of the cost
+  cv::Mat   band     = in_frame;
+  const int target_h = band.cols / 2;
+  if (band.rows > target_h) {
+    const int y0 = (band.rows - target_h) / 2;
+    band         = band(cv::Rect(0, y0, band.cols, target_h));
+  }
+  cv::Mat resized = band;
+  if (band.rows != kInputHeight || band.cols != kInputWidth) {
+    cv::resize(band, resized, cv::Size(kInputWidth, kInputHeight), 0, 0, cv::INTER_LINEAR);
+  }
   cv::Mat rgb;
   if (in_is_rgb) {
-    rgb = in_frame;
+    rgb = resized;
   } else {
-    cv::cvtColor(in_frame, rgb, cv::COLOR_BGR2RGB);
-  }
-
-  // Vehicle preprocessing (planner_io.preprocess_frame): keep the full width,
-  // center-crop the rows to a 2:1 band, then resize to the model input. Both
-  // cameras go through this; the telephoto frame is a separate sensor's full
-  // frame, not a crop of the wide one. On the hand-off package the JPEGs are
-  // already 512x256, so both steps are no-ops there
-  const int target_h = rgb.cols / 2;
-  if (rgb.rows > target_h) {
-    const int y0 = (rgb.rows - target_h) / 2;
-    rgb          = rgb(cv::Rect(0, y0, rgb.cols, target_h));
-  }
-  if (rgb.rows != kInputHeight || rgb.cols != kInputWidth) {
-    cv::resize(rgb, rgb, cv::Size(kInputWidth, kInputHeight), 0, 0, cv::INTER_LINEAR);
+    cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
   }
 
   cv::Mat frame_f32;
@@ -181,15 +185,32 @@ int NearestWithin(const std::vector<double> &stamps_s, double target_s, double t
 class ViewWindowImpl : public ViewWindow {
  public:
   explicit ViewWindowImpl(const ViewWindowParams &params)
-      : params_(params), views_(static_cast<std::size_t>(params.num_views)) {}
+      : params_(params), views_(static_cast<std::size_t>(params.num_views)) {
+    // An all-zero image after /255 and the ImageNet normalization
+    blank_chw_.resize(kFrameNumel);
+    for (int c = 0; c < 3; ++c) {
+      std::fill_n(blank_chw_.begin() + static_cast<std::ptrdiff_t>(c * kPlane), kPlane,
+                  -kImageNetMean[c] / kImageNetStd[c]);
+    }
+  }
 
   ViewWindowImpl(const ViewWindowImpl &)            = delete;
   ViewWindowImpl &operator=(const ViewWindowImpl &) = delete;
   ~ViewWindowImpl() override                        = default;
 
   void Push(int view, const cv::Mat &in_frame, double stamp_s, bool in_is_rgb) final {
+    std::vector<float> chw(kFrameNumel);
+    if (!PreprocessFrame(in_frame, chw.data(), in_is_rgb)) return;
+    PushPreprocessed(view, std::move(chw), stamp_s);
+  }
+
+  void PushPreprocessed(int view, std::vector<float> &&in_chw, double stamp_s) final {
     if (view < 0 || view >= params_.num_views) {
       LOGE("ViewWindow::Push: view %d out of range (%d views)", view, params_.num_views);
+      return;
+    }
+    if (in_chw.size() != static_cast<std::size_t>(kFrameNumel)) {
+      LOGE("ViewWindow::PushPreprocessed: %zu floats, a frame is %d", in_chw.size(), kFrameNumel);
       return;
     }
     View &v = views_[static_cast<std::size_t>(view)];
@@ -202,8 +223,7 @@ class ViewWindowImpl : public ViewWindow {
     }
     Frame frame;
     frame.stamp_s = stamp_s;
-    frame.chw.resize(kFrameNumel);
-    if (!PreprocessFrame(in_frame, frame.chw.data(), in_is_rgb)) return;
+    frame.chw     = std::move(in_chw);
     v.frames.push_back(std::move(frame));
     v.newest_s = v.frames.size() == 1 ? stamp_s : std::max(v.newest_s, stamp_s);
     while (!v.frames.empty() && v.frames.front().stamp_s < v.newest_s - params_.retain_s) {
@@ -226,7 +246,7 @@ class ViewWindowImpl : public ViewWindow {
       const View &view = views_[static_cast<std::size_t>(v)];
       for (int t = 0; t < kNumHistFrames; ++t) {
         const int i = indices[static_cast<std::size_t>(v)][static_cast<std::size_t>(t)];
-        PlaceFrame(out_video, v, t, view.frames[static_cast<std::size_t>(i)].chw.data());
+        PlaceFrame(out_video, v, t, i < 0 ? blank_chw_.data() : view.frames[static_cast<std::size_t>(i)].chw.data());
       }
     }
     return sel;
@@ -315,6 +335,11 @@ class ViewWindowImpl : public ViewWindow {
       for (int t = 0; t < kNumHistFrames; ++t) {
         const double wide_stamp = sel.stamps_s[0][static_cast<std::size_t>(t)];
         const int    i          = NearestWithin(stamps, wide_stamp, params_.view_tolerance_s);
+        if (i < 0 && params_.fill_missing_views) {
+          sel.filled.emplace_back(v, t);
+          indices[static_cast<std::size_t>(v)][static_cast<std::size_t>(t)] = -1;
+          continue;
+        }
         if (i < 0) {
           const int    nearest = Nearest(stamps, wide_stamp);
           const double off     = nearest < 0 ? std::numeric_limits<double>::infinity()
@@ -343,8 +368,9 @@ class ViewWindowImpl : public ViewWindow {
     return true;
   }
 
-  ViewWindowParams  params_;
-  std::vector<View> views_;
+  ViewWindowParams   params_;
+  std::vector<View>  views_;
+  std::vector<float> blank_chw_;
 };
 
 std::shared_ptr<ViewWindow> CreateViewWindow(const ViewWindowParams &params) {
