@@ -85,7 +85,9 @@ with `planning_setting:=latentdrive`): frames preprocessed once on arrival,
 the four history slots picked by stamp, side views paired within 50 ms,
 route points from the route, motion terms from differenced poses, one plan per
 CAM_FRONT frame at 10 Hz. Build an engine for the checkpoint first (on the GPU
-that will run it; see [Commands](#commands)):
+that will run it; see [Commands](#commands)). `scripts/build.sh [onnx ...]` does
+all of it -- library, unit tests, the ROS 2 package and an engine per ONNX
+(default: the camfront3 lane2 export) -- or by hand:
 
 ```bash
 cmake -B build && cmake --build build -j
@@ -329,6 +331,7 @@ src/cpp/
                 StatusBuilderImpl (route points, motion terms)
   visualizer/   BevVisualizerImpl, CameraProjectorImpl
   main/         gflags mode dispatch (build-engine, run-package, visualize)
+scripts/        build.sh: library, tests, ROS 2 package and engines in one go
 tests/          ctest unit tests (view window, status builder)
 samples/
   sample_data/  export_clip.py (rosbag -> clip), run_clip.cpp (latentdrive-sample-clip)
