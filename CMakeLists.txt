@@ -135,6 +135,18 @@ set_target_properties(
                              OUTPUT_NAME ${PROJECT_NAME})
 
 # ==============================================================================
+# Samples
+# ==============================================================================
+# samples/sample_data: the offline pipeline on a clip cut from a rosbag
+# (export_clip.py), with the library API alone. The rosbag sample is the ROS 2
+# package under ros2/ and builds with colcon
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/samples/sample_data/run_clip.cpp
+                            PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
+add_executable(latentdrive-sample-clip ${CMAKE_CURRENT_SOURCE_DIR}/samples/sample_data/run_clip.cpp)
+target_link_libraries(latentdrive-sample-clip PRIVATE latentdrive)
+set_target_properties(latentdrive-sample-clip PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ==============================================================================
 # Unit tests (ctest)
 # ==============================================================================
 # Plain-assert tests of the preprocessing window (history picked by nearest
