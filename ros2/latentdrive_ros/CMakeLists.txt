@@ -61,6 +61,7 @@ ament_target_dependencies(latentdrive_node rclcpp sensor_msgs nav_msgs geometry_
 
 install(TARGETS latentdrive_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})
-install(PROGRAMS scripts/export_route.py scripts/publish_latched.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/export_route.py scripts/publish_latched.py scripts/publish_map.py
+  DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

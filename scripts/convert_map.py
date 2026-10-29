@@ -13,10 +13,18 @@ where the map has one (use_waypoints). This writes exactly those centerlines,
 so a replay needs only this file and the route in the bag -- no lanelet2,
 no map loader:
 
-    {"source": ..., "resolution_m": 5.0, "lanelets": {"<id>": [[x, y], ...], ...}}
+    {"source": ..., "resolution_m": 5.0,
+     "lanelets": {"<id>": [[x, y], ...], ...},
+     "viz": {"lines": [{"kind": ..., "points": [[x, y, z], ...]}, ...],
+             "lanes": {"<id>": {"subtype": ..., "left": [[x, y, z], ...], "right": [...]}, ...}}}
+
+`lanelets` is what the planner reads. `viz` is for drawing the map
+(publish_map.py): the painted lines (`lane`, `lane_dashed`, `road_border`,
+`stop_line`) and every lanelet's two bounds resampled pairwise every 2 m, so
+a lane area is a triangle strip.
 
 Coordinates are the map frame: the nodes' local_x / local_y tags, which
-Autoware's MGRS maps carry. Pure Python, no dependencies.
+Autoware's MGRS maps carry, and the `ele` tag. Pure Python, no dependencies.
 """
 import argparse
 import json
@@ -25,10 +33,12 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 
+VIZ_RESOLUTION_M = 2.0
+
 
 def load_osm(path):
-    """Nodes (id -> (x, y, z)), ways (id -> node ids) and lanelet relations
-    (id -> (left way, right way, waypoints way or None))"""
+    """Nodes (id -> (x, y, z)), ways (id -> (node ids, type, subtype)) and
+    lanelet relations (id -> (left way, right way, waypoints way or None, subtype))"""
     nodes, ways, lanelets = {}, {}, {}
     for _, el in ET.iterparse(path, events=("end",)):
         if el.tag == "node":
@@ -39,7 +49,9 @@ def load_osm(path):
             nodes[int(el.get("id"))] = (float(tags["local_x"]), float(tags["local_y"]), float(tags.get("ele", 0.0)))
             el.clear()
         elif el.tag == "way":
-            ways[int(el.get("id"))] = [int(n.get("ref")) for n in el.findall("nd")]
+            tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
+            ways[int(el.get("id"))] = ([int(n.get("ref")) for n in el.findall("nd")],
+                                       tags.get("type", ""), tags.get("subtype", ""))
             el.clear()
         elif el.tag == "relation":
             tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
@@ -47,7 +59,7 @@ def load_osm(path):
                 roles = {m.get("role"): int(m.get("ref")) for m in el.findall("member") if m.get("type") == "way"}
                 if "left" in roles and "right" in roles:
                     waypoints = int(tags["waypoints"]) if tags.get("waypoints", "").isdigit() else None
-                    lanelets[int(el.get("id"))] = (roles["left"], roles["right"], waypoints)
+                    lanelets[int(el.get("id"))] = (roles["left"], roles["right"], waypoints, tags.get("subtype", ""))
             el.clear()
     return nodes, ways, lanelets
 
@@ -74,37 +86,66 @@ def resample(points, num_segments):
     return out
 
 
-def fine_centerline(left, right, resolution):
-    """lanelet::utils::generateFineCenterline"""
+def paired_bounds(left, right, resolution):
+    """Both bounds resampled to the same number of points, one every
+    `resolution` metres along the longer one"""
     length = lambda pts: sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))  # noqa: E731
     num_segments = max(math.ceil(max(length(left), length(right)) / resolution), 1)
-    return [((l[0] + r[0]) / 2, (l[1] + r[1]) / 2) for l, r in
-            zip(resample(left, num_segments), resample(right, num_segments))]
+    return resample(left, num_segments), resample(right, num_segments)
+
+
+def fine_centerline(left, right, resolution):
+    """lanelet::utils::generateFineCenterline"""
+    return [((l[0] + r[0]) / 2, (l[1] + r[1]) / 2) for l, r in zip(*paired_bounds(left, right, resolution))]
+
+
+def line_kind(way_type, subtype):
+    """How a way is drawn, or None for one that is not painted (virtual)"""
+    if way_type in ("line_thin", "line_thick"):
+        return "lane_dashed" if "dashed" in subtype else "lane"
+    if way_type in ("road_border", "curbstone", "guard_rail", "wall", "fence"):
+        return "road_border"
+    if way_type == "stop_line":
+        return "stop_line"
+    return None
 
 
 def convert(osm_path, resolution):
     nodes, ways, lanelets = load_osm(osm_path)
-    out, from_waypoints, inverted = {}, 0, 0
-    for lid, (left_id, right_id, waypoints_id) in lanelets.items():
+    centerlines, lanes, bound_ways = {}, {}, set()
+    from_waypoints = inverted = 0
+    xyz = lambda pts: [[round(c, 2) for c in p] for p in pts]  # noqa: E731
+    for lid, (left_id, right_id, waypoints_id, subtype) in lanelets.items():
+        left = [nodes[n] for n in ways[left_id][0]]
+        right = [nodes[n] for n in ways[right_id][0]]
+        if len(left) < 2 or len(right) < 2:
+            continue
+        # A bound shared with the neighbouring lane may be stored against the
+        # driving direction (~10 % of the lanelets of a vehicle map); lanelet2
+        # inverts it on load, the left bound keeps its order. Paired as
+        # stored, the midpoints would fold onto the middle of the lanelet
+        if math.dist(left[0], right[0]) + math.dist(left[-1], right[-1]) > \
+           math.dist(left[0], right[-1]) + math.dist(left[-1], right[0]):
+            right = right[::-1]
+            inverted += 1
         if waypoints_id is not None and waypoints_id in ways:
-            line = [nodes[n][:2] for n in ways[waypoints_id]]
+            line = [nodes[n][:2] for n in ways[waypoints_id][0]]
             from_waypoints += 1
         else:
-            left = [nodes[n] for n in ways[left_id]]
-            right = [nodes[n] for n in ways[right_id]]
-            if len(left) < 2 or len(right) < 2:
-                continue
-            # A bound shared with the neighbouring lane may be stored against
-            # the driving direction (~10 % of the lanelets of a vehicle map);
-            # lanelet2 inverts it on load, the left bound keeps its order. Paired
-            # as stored, the midpoints would fold onto the middle of the lanelet
-            if math.dist(left[0], right[0]) + math.dist(left[-1], right[-1]) > \
-               math.dist(left[0], right[-1]) + math.dist(left[-1], right[0]):
-                right = right[::-1]
-                inverted += 1
             line = fine_centerline(left, right, resolution)
-        out[str(lid)] = [[round(x, 4), round(y, 4)] for x, y in line]
-    return out, from_waypoints, inverted
+        centerlines[str(lid)] = [[round(x, 4), round(y, 4)] for x, y in line]
+        viz_left, viz_right = paired_bounds(left, right, VIZ_RESOLUTION_M)
+        lanes[str(lid)] = {"subtype": subtype, "left": xyz(viz_left), "right": xyz(viz_right)}
+        if subtype != "crosswalk":
+            bound_ways.update((left_id, right_id))
+    lines = []
+    for wid, (refs, way_type, subtype) in ways.items():
+        if wid not in bound_ways and way_type != "stop_line":
+            continue
+        kind = line_kind(way_type, subtype)
+        if kind is not None and len(refs) >= 2:
+            lines.append({"kind": kind, "points": xyz(nodes[n] for n in refs)})
+    return centerlines, {"lines": lines, "lanes": lanes}, from_waypoints, inverted
 
 
 def route_polyline(centerlines, lanelet_ids, goal_xy):
@@ -134,13 +175,12 @@ def main():
                     help="centerline resolution [m], the map loader's center_line_resolution")
     a = ap.parse_args()
     osm = os.path.join(a.map, "lanelet2_map.osm") if os.path.isdir(a.map) else a.map
-    centerlines, from_waypoints, inverted = convert(osm, a.resolution)
+    centerlines, viz, from_waypoints, inverted = convert(osm, a.resolution)
     with open(a.out, "w") as f:
-        json.dump({"source": os.path.abspath(osm), "resolution_m": a.resolution, "lanelets": centerlines},
-                  f, separators=(",", ":"))
+        json.dump({"source": os.path.abspath(osm), "resolution_m": a.resolution, "lanelets": centerlines,
+                   "viz": viz}, f, separators=(",", ":"))
     print(f"{len(centerlines)} lanelets ({from_waypoints} from waypoints, {inverted} with the right bound "
-          f"inverted) -> {a.out} "
-          f"({os.path.getsize(a.out) / 1e6:.1f} MB)")
+          f"inverted), {len(viz['lines'])} painted lines -> {a.out} ({os.path.getsize(a.out) / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":

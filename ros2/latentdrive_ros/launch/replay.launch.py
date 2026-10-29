@@ -18,8 +18,10 @@ subgoal or six route points. Where the route comes from (route_source):
 
 The node publishes /latentdrive_node/viz (camera + BEV image, also as
 /viz/compressed), /latentdrive_node/plan (base_link) and, in the map frame,
-/latentdrive_node/plan_map and /latentdrive_node/route_points. viewer:=rviz
-(default) opens RViz on all of them next to the plan the vehicle recorded;
+/latentdrive_node/plan_map and /latentdrive_node/route_points. With
+lanelet_map:= the map is drawn too (publish_map.py: road, lane lines, the
+route's lanes, the ego car). viewer:=rviz (default) opens RViz on all of them
+next to the plan the vehicle recorded, following the car from behind;
 viewer:=rqt opens rqt_image_view on the image only; viewer:=none is headless.
 """
 import os
@@ -72,6 +74,7 @@ def bag_nodes(context):
             "missing_view_fill": value("missing_view_fill"),
             "max_rate_hz": float(value("max_rate_hz")),
             "recorded_route_points_topic": RECORDED_ROUTE_POINTS,
+            "viz_route_points": value("show_route_points") == "true",
         }],
     )
     # /tf_static and the route are recorded once, when they are set, so a bag
@@ -83,7 +86,15 @@ def bag_nodes(context):
                    "--route-topic", ROUTE if source == "mission" else ""],
         output="log",
     )
-    return [planner, latched]
+    nodes = [planner, latched]
+    # The map under the plan: road, lane lines, the route's lanes, the ego car
+    if value("lanelet_map"):
+        nodes.append(Node(
+            package="latentdrive_ros", executable="publish_map.py", name="map_viz",
+            arguments=[value("lanelet_map"), "--route-topic", ROUTE], output="log",
+            parameters=[{"use_sim_time": True}],
+        ))
+    return nodes
 
 
 def generate_launch_description():
@@ -136,6 +147,9 @@ def generate_launch_description():
         DeclareLaunchArgument("play_delay", default_value="8.0",
                               description="seconds between node start and bag play (engine load)"),
         DeclareLaunchArgument("viewer", default_value="rviz", description="rviz | rqt | none"),
+        DeclareLaunchArgument("show_route_points", default_value="false",
+                              description="true: draw the route points fed to the model (RViz layer and "
+                                          "BEV panel)"),
         OpaqueFunction(function=bag_nodes),
         # The node needs a few seconds to deserialize the engine and warm it
         # up; frames played before that are lost and the first plans would

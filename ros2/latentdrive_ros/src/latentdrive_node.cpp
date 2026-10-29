@@ -147,6 +147,7 @@ class LatentDriveNode : public rclcpp::Node {
     const auto smooth_alpha = declare_parameter<double>("smooth_alpha", 0.35);
     viz_jpeg_quality_ = static_cast<int>(declare_parameter<int64_t>("viz_jpeg_quality", 80));
     const auto viz_reliable = declare_parameter<bool>("viz_reliable", false);
+    viz_route_points_ = declare_parameter<bool>("viz_route_points", true);
     // View order of the camfront3 models: front, front_left, front_right. On
     // the prd_jt vehicles these are camera0 (57 deg), camera3 (+49.5 deg) and
     // camera4 (-49.6 deg); a single-view engine reads the first one only
@@ -848,11 +849,15 @@ class LatentDriveNode : public rclcpp::Node {
 
     bev_->Clear();
     bev_->DrawTrajectoryHorizon(plan, 2);
-    for (const common::RoutePoint &p : ego.route_points) bev_->DrawSubgoal(p.x_m, p.y_m);
+    if (viz_route_points_) {
+      for (const common::RoutePoint &p : ego.route_points) bev_->DrawSubgoal(p.x_m, p.y_m);
+    }
     bev_->DrawVelocity(ego.vel_x, ego.vel_y);
     bev_->AddLegend("plan now->+4s", visualizer::HorizonColor(0.0));
-    bev_->AddLegend(ego.route_points.size() == 1 ? "subgoal 50m" : "route points",
-                    visualizer::color::kSubgoal);
+    if (viz_route_points_) {
+      bev_->AddLegend(ego.route_points.size() == 1 ? "subgoal 50m" : "route points",
+                      visualizer::color::kSubgoal);
+    }
 
     const int H = 560;
     cv::Mat cam_panel, bev_panel;
@@ -966,6 +971,7 @@ class LatentDriveNode : public rclcpp::Node {
   std::thread viz_thread_;
   bool viz_stop_ = false;
   int viz_jpeg_quality_ = 80;
+  bool viz_route_points_ = true;  // draw the route points in the BEV
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_viz_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_viz_jpeg_;

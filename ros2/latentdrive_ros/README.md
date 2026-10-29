@@ -60,7 +60,8 @@ waypoints.
 the engine), `route_reversal_deg` (120); `motion_source` (pose_difference |
 twist); `odom_topic`, `accel_topic`; `calibration_file` + `scene_match`
 (overlay from a hand-off calibration.json instead of the bag); `smooth_alpha`
-(0.35, the drawn plan only), `viz_jpeg_quality`, `viz_reliable`.
+(0.35, the drawn plan only), `viz_jpeg_quality`, `viz_reliable`, `viz_route_points`
+(true: the route points in the BEV panel).
 
 ## Build and run
 
@@ -80,7 +81,9 @@ Scripts: `export_route.py <bag_dir>` writes the driven path as `route.npy` for
 `uv run --with mcap --with mcap-ros2-support --with numpy`);
 `publish_latched.py <bag_dir> --start-offset S` latches the bag's `/tf_static`
 and the route in effect at S for a replay that starts past them (the launch
-runs it); `grab_viz.py --count N` saves N
+runs it); `publish_map.py <map.json>` draws the lanelet map around the car,
+the route's lanes and the ego box for RViz (the launch runs it with
+`lanelet_map:=`); `grab_viz.py --count N` saves N
 frames of `~/viz` as PNGs (headless check).
 
 ## Live window from a container (X11)
