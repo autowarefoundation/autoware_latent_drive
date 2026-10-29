@@ -60,6 +60,12 @@ if [ "${SKIP_ROS:-0}" != 1 ]; then
     # shellcheck disable=SC1090
     source "$setup"
   fi
+  # autoware_planning_msgs (the mission-planning route): from apt
+  # (ros-<distro>-autoware-planning-msgs), or the Autoware images' /opt/autoware
+  if ! ros2 pkg prefix autoware_planning_msgs > /dev/null 2>&1 && [ -f /opt/autoware/setup.bash ]; then
+    # shellcheck disable=SC1091
+    source /opt/autoware/setup.bash
+  fi
   (cd "$REPO/ros2" && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release)
 fi
 

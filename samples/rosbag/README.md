@@ -2,15 +2,29 @@
 
 Play a vehicle rosbag and let the `latentdrive_ros` node plan on it as it
 plays, the way the vehicle node does: the cameras, odometry and acceleration
-come in as topics, one plan per CAM_FRONT frame goes out. RViz shows the plan,
-the route points and the camera + BEV image next to the plan the vehicle
-recorded.
+come in as topics, one plan per CAM_FRONT frame goes out, and the route comes
+from mission planning like on the car. RViz shows the plan, the route points
+and the camera + BEV image next to the plan the vehicle recorded.
 
 ## Once
 
 ```bash
 source /opt/ros/<distro>/setup.bash                    # humble or jazzy
-cd ros2 && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release && cd ..
+scripts/build.sh                                       # or: cd ros2 && colcon build
+```
+
+The package needs `autoware_planning_msgs` (the route message): in the
+Autoware images it is under `/opt/autoware`, which `scripts/build.sh`
+sources; elsewhere `apt install ros-<distro>-autoware-planning-msgs`.
+
+Per map: the route the model follows is the centerlines of the route's
+lanelets, so the replay needs the lanelet2 map the vehicle drove with (the
+one its route was planned on, e.g. from Web.Auto). `convert_map.py` turns
+its `lanelet2_map.osm` into those centerlines, computed exactly as
+Autoware's map loader does (5 m fine centerlines), as one JSON file:
+
+```bash
+scripts/convert_map.py /data/maps/1423-20261021061041533656 /data/maps/1423.json
 ```
 
 Per bag: the vehicle records a directory of `.mcap` files without
@@ -25,7 +39,8 @@ samples/rosbag/prepare_bag.sh /media/.../0ed0b1e4-..._2026-10-23-15-51-20_p0900 
 ## Run
 
 ```bash
-samples/rosbag/run_replay.sh /data/bags/1551 models/engine/camfront3-rptw-lane2-e1-mixed.engine start_offset:=60
+samples/rosbag/run_replay.sh /data/bags/1551 models/engine/camfront3-rptw-lane2-e1-mixed.engine \
+    lanelet_map:=/data/maps/1423.json start_offset:=60
 ```
 
 `run_replay.sh <bag> <engine> [arg:=value ...]` is `ros2 launch latentdrive_ros
@@ -35,7 +50,8 @@ plays the bag with `--clock` and opens RViz.
 
 | launch arg | default | |
 |---|---|---|
-| `route_source` | `recorded` | `recorded`: the route points the vehicle fed its model (`/tensorrt_e2e/debug/latentdrive/route_points`, in the bags of LatentDrive runs); `file`: build them from `route:=route.npy` |
+| `lanelet_map` | | the map's centerlines (`scripts/convert_map.py`), for `route_source:=mission` |
+| `route_source` | `auto` | `mission`: the bag's `/planning/mission_planning/route` on `lanelet_map`, as the vehicle builds it; `recorded`: the route points the vehicle fed its model (`/tensorrt_e2e/debug/latentdrive/route_points`, only in the bags of LatentDrive runs); `file`: built from `route:=route.npy`; `auto`: `mission` when `lanelet_map` is given, else `recorded` |
 | `route` | | for `route_source:=file`; make one with `ros2/latentdrive_ros/scripts/export_route.py <bag_dir>` (the driven path) |
 | `camera0`, `camera1`, `camera2` | camera0, camera3, camera4 `/image_raw/compressed` | views 0..2 (CAM_FRONT, FRONT_LEFT, FRONT_RIGHT); a single-camera engine reads camera0 only |
 | `missing_view_fill` | `skip` | `zeros`: a side slot with no frame within 50 ms gets the blank frame the camfront3 training used |
@@ -48,8 +64,26 @@ plays the bag with `--clock` and opens RViz.
 
 What a bag needs: the camera topics, `/localization/kinematic_state`,
 `/localization/acceleration`, `/tf_static` and the view-0 `camera_info`, and
-for `route_source:=recorded` the vehicle's route points (only LatentDrive runs
-have them; for any other bag use `route_source:=file`).
+`/planning/mission_planning/route` for `route_source:=mission` (any Autoware
+bag that recorded it) or the vehicle's route points for
+`route_source:=recorded` (LatentDrive runs only).
+
+### The route
+
+With `route_source:=mission` the node takes the route the way the vehicle's
+planner does: the route's preferred lanelets in order, their centerlines
+joined into one polyline and cut at the goal, then the route points 5 .. 50 m
+ahead of the ego along it. The route is published once, when it is set, so
+the launch latches the one in effect at `start_offset` from the bag
+(`publish_latched.py`); a reroute later in the bag is played as recorded.
+
+On a LatentDrive run (2026-10-23, map 1423) the route points this gives are
+the ones the vehicle recorded, to the centimetre, on every tick but the few
+where the vehicle's odometry sample came 20 ms later (one 1 m vertex). The
+node logs the route it built (`route: 70 lanelets -> 584 centerline points`)
+and an error when route lanelets are missing from the map: the route was
+planned on another map revision, the stretches without lanelets are bridged
+with straight lines, and the route points there are unreliable.
 
 ## Reading the output
 

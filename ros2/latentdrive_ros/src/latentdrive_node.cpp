@@ -32,6 +32,13 @@
 // times jitter by tens of milliseconds under bag playback; the stamps do not.
 //
 // Route (the status' route points), `route_source`:
+//   mission   the route from mission planning (autoware_planning_msgs/
+//             LaneletRoute on `route_topic`, in any Autoware bag) plus the
+//             map's lanelet centerlines (`lanelet_map`, a JSON written by
+//             scripts/convert_map.py from lanelet2_map.osm): the preferred
+//             lanelets' centerlines in route order, cut at the goal -- the
+//             polyline the vehicle's planner builds, then turned into route
+//             points the way it does (below)
 //   recorded  the route points the vehicle's planner fed the model, recorded
 //             in the bag on /tensorrt_e2e/debug/latentdrive/route_points (map
 //             frame) -- the same input the car saw, from its lanelet route
@@ -53,6 +60,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <pthread.h>
 #include <string>
 #include <thread>
@@ -67,6 +75,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
+#include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <geometry_msgs/msg/accel_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -157,6 +166,8 @@ class LatentDriveNode : public rclcpp::Node {
         "accel_topic", "/localization/acceleration");
     route_source_ = declare_parameter<std::string>("route_source", "recorded");
     const auto route = declare_parameter<std::string>("route_file", "");
+    const auto lanelet_map = declare_parameter<std::string>("lanelet_map", "");
+    const auto route_topic = declare_parameter<std::string>("route_topic", "/planning/mission_planning/route");
     const auto recorded_topic = declare_parameter<std::string>(
         "recorded_route_points_topic", "/tensorrt_e2e/debug/latentdrive/route_points");
     const auto route_points_m =
@@ -168,8 +179,8 @@ class LatentDriveNode : public rclcpp::Node {
     if (missing_view_fill != "skip" && missing_view_fill != "zeros") {
       throw std::runtime_error("missing_view_fill must be skip or zeros, got " + missing_view_fill);
     }
-    if (route_source_ != "recorded" && route_source_ != "file") {
-      throw std::runtime_error("route_source must be recorded or file, got " + route_source_);
+    if (route_source_ != "mission" && route_source_ != "recorded" && route_source_ != "file") {
+      throw std::runtime_error("route_source must be mission, recorded or file, got " + route_source_);
     }
     if (motion_source != "pose_difference" && motion_source != "twist") {
       throw std::runtime_error("motion_source must be pose_difference or twist, got " + motion_source);
@@ -216,6 +227,7 @@ class LatentDriveNode : public rclcpp::Node {
       }
     }
     if (route_source_ == "file") LoadRoute(route);
+    if (route_source_ == "mission") LoadLaneletMap(lanelet_map);
 
     // warmup so the first real inference is not slow
     const std::vector<float> zeros(planner_->VideoNumel(), 0.f);
@@ -258,6 +270,13 @@ class LatentDriveNode : public rclcpp::Node {
           std::lock_guard<std::mutex> lock(plan_mutex_);
           accel_ = m;
         });
+    if (route_source_ == "mission") {
+      // Latched by mission planning (and by the replay launch for a bag
+      // started past it): a subscriber that comes late still gets it
+      sub_route_ = create_subscription<autoware_planning_msgs::msg::LaneletRoute>(
+          route_topic, rclcpp::QoS(1).reliable().transient_local(),
+          [this](autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr m) { OnLaneletRoute(*m); });
+    }
     if (route_source_ == "recorded") {
       sub_recorded_ = create_subscription<geometry_msgs::msg::PoseArray>(
           recorded_topic, rclcpp::QoS(10),
@@ -309,6 +328,9 @@ class LatentDriveNode : public rclcpp::Node {
 
     std::string views;
     for (const auto &t : camera_topics_) views += (views.empty() ? "" : ", ") + t;
+    const std::string route_from = route_source_ == "mission"    ? route_topic + " + " + lanelet_map
+                                   : route_source_ == "recorded" ? recorded_topic
+                                                                 : route;
     RCLCPP_INFO(get_logger(),
                 "latentdrive_node ready: %d view%s [%s] (side views within %.0f ms, missing -> %s), "
                 "status [1, %d] = %d route point%s from %s, motion from %s, %d waypoints, "
@@ -316,7 +338,7 @@ class LatentDriveNode : public rclcpp::Node {
                 num_views_, num_views_ == 1 ? "" : "s", views.c_str(), view_tolerance_s_ * 1e3,
                 missing_view_fill.c_str(), planner_->StatusDim(), planner_->NumRoutePoints(),
                 planner_->NumRoutePoints() == 1 ? "" : "s",
-                route_source_ == "recorded" ? recorded_topic.c_str() : route.c_str(),
+                route_from.c_str(),
                 motion_source.c_str(), planner_->NumWaypoints(), max_rate_hz);
   }
 
@@ -341,7 +363,7 @@ class LatentDriveNode : public rclcpp::Node {
 
  private:
   // The view-0 frame waiting to be planned on, with the ego sampled at its
-  // arrival; the status is filled in when the plan is staged
+  // stamp; the status is filled in when the plan is staged
   struct Pending {
     double stamp_s;
     builtin_interfaces::msg::Time stamp;
@@ -382,10 +404,93 @@ class LatentDriveNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "loaded route: %zu points from %s", route.size(), path.c_str());
   }
 
+  // @brief: the lanelet centerlines of scripts/convert_map.py,
+  // {"lanelets": {"<id>": [[x, y], ...]}} in the map frame
+  void LoadLaneletMap(const std::string &path) {
+    if (path.empty()) {
+      throw std::runtime_error("route_source:=mission needs lanelet_map (scripts/convert_map.py <lanelet2_map.osm> map.json)");
+    }
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot open lanelet_map " + path);
+    const auto map = nlohmann::json::parse(f);
+    for (const auto &[id, line] : map.at("lanelets").items()) {
+      auto &points = centerlines_[std::stoll(id)];
+      for (const auto &p : line) points.push_back({p[0].get<double>(), p[1].get<double>()});
+    }
+    RCLCPP_INFO(get_logger(), "lanelet map: %zu lanelet centerlines from %s", centerlines_.size(), path.c_str());
+  }
+
+  // @brief: the route as the vehicle's planner builds it -- the centerlines
+  // of the preferred lanelets in route order (repeated joints dropped), cut
+  // at the point nearest the goal. A new route (a reroute) replaces the old
+  void OnLaneletRoute(const autoware_planning_msgs::msg::LaneletRoute &m) {
+    std::vector<status::Point2d> polyline;
+    std::vector<int64_t> missing;
+    for (const auto &segment : m.segments) {
+      const auto it = centerlines_.find(segment.preferred_primitive.id);
+      if (it == centerlines_.end()) {
+        missing.push_back(segment.preferred_primitive.id);
+        continue;
+      }
+      for (const auto &p : it->second) {
+        if (polyline.empty() || std::hypot(p.x - polyline.back().x, p.y - polyline.back().y) > 1e-3) {
+          polyline.push_back(p);
+        }
+      }
+    }
+    if (polyline.size() < 2) {
+      RCLCPP_ERROR(get_logger(), "route of %zu lanelets: none of them is in the lanelet map -- the route was "
+                   "planned on another map", m.segments.size());
+      return;
+    }
+    const double gx = m.goal_pose.position.x, gy = m.goal_pose.position.y;
+    std::size_t nearest = 0;
+    for (std::size_t i = 1; i < polyline.size(); ++i) {
+      if (std::hypot(polyline[i].x - gx, polyline[i].y - gy) <
+          std::hypot(polyline[nearest].x - gx, polyline[nearest].y - gy)) {
+        nearest = i;
+      }
+    }
+    polyline.resize(nearest + 1);
+    {
+      std::lock_guard<std::mutex> lock(plan_mutex_);
+      status_->SetRoute(polyline);
+    }
+    RCLCPP_INFO(get_logger(), "route: %zu lanelets -> %zu centerline points", m.segments.size(), polyline.size());
+    if (!missing.empty()) {
+      RCLCPP_ERROR(get_logger(),
+                   "%zu of the route's %zu lanelets are not in the lanelet map (first: %ld): the route was "
+                   "planned on another map revision. Those stretches are bridged with straight lines and "
+                   "the route points there are unreliable -- convert the map the vehicle drove with",
+                   missing.size(), m.segments.size(), static_cast<long>(missing.front()));
+    }
+  }
+
   void OnOdometry(nav_msgs::msg::Odometry::ConstSharedPtr m) {
     std::lock_guard<std::mutex> lock(plan_mutex_);
     odom_ = m;
+    if (!odom_history_.empty() && Seconds(m->header.stamp) < Seconds(odom_history_.back()->header.stamp) - 1.0) {
+      odom_history_.clear();  // the bag looped or jumped back
+    }
+    odom_history_.push_back(m);
+    while (odom_history_.size() > 100) odom_history_.pop_front();  // 2 s at 50 Hz
     status_->PushPose(ToSample(*m));
+  }
+
+  static double Seconds(const builtin_interfaces::msg::Time &t) { return t.sec + t.nanosec * 1e-9; }
+
+  // @brief: the odometry stamped nearest to `stamp_s`. On the vehicle the
+  // planner gets a camera frame a few ms after its stamp and takes the newest
+  // odometry then, a few ms past the frame (measured on a LatentDrive run:
+  // +4 ms). In a bag the frames were logged ~100 ms after their stamps --
+  // the recorder's own latency -- and are played that late, so the newest
+  // odometry at arrival is ~0.1 s too new: 1-2 m along the route at speed
+  nav_msgs::msg::Odometry::ConstSharedPtr OdomAt(double stamp_s) const {
+    nav_msgs::msg::Odometry::ConstSharedPtr best = odom_;
+    for (const auto &o : odom_history_) {
+      if (std::abs(Seconds(o->header.stamp) - stamp_s) < std::abs(Seconds(best->header.stamp) - stamp_s)) best = o;
+    }
+    return best;
   }
 
   status::PoseSample ToSample(const nav_msgs::msg::Odometry &m) const {
@@ -472,10 +577,11 @@ class LatentDriveNode : public rclcpp::Node {
                            window_->Size(0));
       return;
     }
-    // The ego is sampled now, with the front frame, so a plan that waits for
-    // its side views (or the recorded route points) still describes this instant
-    pending_ = Pending{stamp_s, msg->header.stamp, frame, {}, ToSample(*odom_),
-                       odom_->pose.pose.position.z};
+    // The ego is sampled at the front frame's stamp, so a plan that waits
+    // for its side views (or the recorded route points) still describes
+    // this instant
+    const auto odom = OdomAt(stamp_s);
+    pending_ = Pending{stamp_s, msg->header.stamp, frame, {}, ToSample(*odom), odom->pose.pose.position.z};
     Stage(false);
   }
 
@@ -527,7 +633,10 @@ class LatentDriveNode : public rclcpp::Node {
       st = status_->Build(pending_->stamp_s, pending_->ego);
     }
     if (!st.ok) {
-      Skip("no status: " + st.error);
+      Skip("no status: " + st.error +
+           (route_source_ == "mission" && !status_->HasRoute()
+                ? " (no usable LaneletRoute yet -- is the route topic in the bag?)"
+                : ""));
       return;
     }
 
@@ -807,7 +916,7 @@ class LatentDriveNode : public rclcpp::Node {
   std::optional<Pending> pending_;
   std::optional<ReadyJob> ready_;
   std::vector<float> spare_video_;
-  // window_, pending_, ready_, spare_video_, status_, odom_, accel_, recorded_, the tallies
+  // window_, pending_, ready_, spare_video_, status_, odom_, odom_history_, accel_, recorded_, the tallies
   std::mutex plan_mutex_;
   std::condition_variable plan_cv_;
   std::thread plan_thread_;
@@ -818,6 +927,8 @@ class LatentDriveNode : public rclcpp::Node {
   std::size_t filled_ = 0;
   double worst_view_offset_s_ = 0.0;
   std::deque<std::pair<double, std::vector<status::Point2d>>> recorded_;
+  // route_source:=mission: lanelet id -> centerline (map frame), read-only after startup
+  std::unordered_map<int64_t, std::vector<status::Point2d>> centerlines_;
   static constexpr double kRecordedMaxGapS = 0.3;
 
   std::shared_ptr<visualizer::BevVisualizer> bev_;
@@ -838,6 +949,7 @@ class LatentDriveNode : public rclcpp::Node {
   common::Trajectory shown_;
 
   nav_msgs::msg::Odometry::ConstSharedPtr odom_;
+  std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> odom_history_;
   geometry_msgs::msg::AccelWithCovarianceStamped::ConstSharedPtr accel_;
 
   std::vector<std::shared_ptr<rclcpp::executors::SingleThreadedExecutor>> camera_executors_;
@@ -846,6 +958,7 @@ class LatentDriveNode : public rclcpp::Node {
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<geometry_msgs::msg::AccelWithCovarianceStamped>::SharedPtr sub_accel_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_recorded_;
+  rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info_;
   std::optional<VizJob> viz_job_;
   std::mutex viz_mutex_;  // viz_job_, viz_stop_, camera_info_

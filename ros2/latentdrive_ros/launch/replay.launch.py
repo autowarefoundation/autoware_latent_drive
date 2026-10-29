@@ -6,9 +6,15 @@
 The engine decides how many cameras are read (the first 1, 2 or 3 of
 camera0/camera1/camera2, default CAM_FRONT, FRONT_LEFT, FRONT_RIGHT of the
 prd_jt vehicles = camera0, camera3, camera4) and whether the status carries one
-subgoal or six route points. The route points come from the bag by default
-(route_source:=recorded: what the vehicle's planner fed the model); with
-route_source:=file they are built from route:=route.npy instead.
+subgoal or six route points. Where the route comes from (route_source):
+
+- mission (the default when lanelet_map:= is given): the bag's mission-planning
+  route (LaneletRoute) on the lanelet centerlines of lanelet_map:=map.json,
+  which scripts/convert_map.py writes from the map's lanelet2_map.osm. Works
+  with any Autoware bag that recorded the route;
+- recorded (the default otherwise): the route points the vehicle's planner fed
+  the model, recorded in the bags of LatentDrive runs;
+- file: built from route:=route.npy.
 
 The node publishes /latentdrive_node/viz (camera + BEV image, also as
 /viz/compressed), /latentdrive_node/plan (base_link) and, in the map frame,
@@ -28,15 +34,25 @@ from launch_ros.actions import Node
 
 RECORDED_ROUTE_POINTS = "/tensorrt_e2e/debug/latentdrive/route_points"
 RECORDED_PLAN = "/tensorrt_e2e/debug/latentdrive/plan"
+ROUTE = "/planning/mission_planning/route"
 
 
-def planner_node(context):
-    """The node, with its parameters resolved here: a list of substitutions
-    would reach it as one concatenated string, and a float given as 10 as an
-    integer -- both are refused by the declared parameter types"""
+def route_source(context):
+    source = LaunchConfiguration("route_source").perform(context)
+    if source == "auto":
+        return "mission" if LaunchConfiguration("lanelet_map").perform(context) else "recorded"
+    return source
+
+
+def bag_nodes(context):
+    """The planner node and the latched-topic publisher, with their parameters
+    resolved here: a list of substitutions would reach the node as one
+    concatenated string, and a float given as 10 as an integer -- both are
+    refused by the declared parameter types"""
     value = lambda name: LaunchConfiguration(name).perform(context)  # noqa: E731
     cameras = [value(f"camera{i}") for i in range(3)]
-    return [Node(
+    source = route_source(context)
+    planner = Node(
         package="latentdrive_ros",
         executable="latentdrive_node",
         name="latentdrive_node",
@@ -46,8 +62,10 @@ def planner_node(context):
             "engine_file": value("engine"),
             "calibration_file": value("calibration"),
             "scene_match": value("scene_match"),
-            "route_source": value("route_source"),
+            "route_source": source,
             "route_file": value("route"),
+            "lanelet_map": value("lanelet_map"),
+            "route_topic": ROUTE,
             "motion_source": value("motion_source"),
             "camera_topics": [c for c in cameras if c],
             "view_tolerance_s": float(value("view_tolerance_s")),
@@ -55,7 +73,17 @@ def planner_node(context):
             "max_rate_hz": float(value("max_rate_hz")),
             "recorded_route_points_topic": RECORDED_ROUTE_POINTS,
         }],
-    )]
+    )
+    # /tf_static and the route are recorded once, when they are set, so a bag
+    # started at start_offset never plays them; this publishes them, latched,
+    # from the bag itself
+    latched = Node(
+        package="latentdrive_ros", executable="publish_latched.py", name="latched_from_bag",
+        arguments=[value("bag"), "--start-offset", value("start_offset"),
+                   "--route-topic", ROUTE if source == "mission" else ""],
+        output="log",
+    )
+    return [planner, latched]
 
 
 def generate_launch_description():
@@ -80,8 +108,13 @@ def generate_launch_description():
                                           "camera_info and /tf_static"),
         DeclareLaunchArgument("scene_match", default_value="prd_jt",
                               description="calibration.json scene entry to use"),
-        DeclareLaunchArgument("route_source", default_value="recorded",
-                              description="recorded (the vehicle's route points in the bag) | file"),
+        DeclareLaunchArgument("route_source", default_value="auto",
+                              description="mission (the bag's LaneletRoute + lanelet_map) | recorded (the "
+                                          "vehicle's route points in the bag) | file | auto: mission when "
+                                          "lanelet_map is given, else recorded"),
+        DeclareLaunchArgument("lanelet_map", default_value="",
+                              description="lanelet centerlines for route_source:=mission "
+                                          "(scripts/convert_map.py <lanelet2_map.osm> map.json)"),
         DeclareLaunchArgument("route", default_value="", description="route.npy for route_source:=file"),
         DeclareLaunchArgument("motion_source", default_value="pose_difference",
                               description="pose_difference (training convention) | twist"),
@@ -103,17 +136,12 @@ def generate_launch_description():
         DeclareLaunchArgument("play_delay", default_value="8.0",
                               description="seconds between node start and bag play (engine load)"),
         DeclareLaunchArgument("viewer", default_value="rviz", description="rviz | rqt | none"),
-        OpaqueFunction(function=planner_node),
-        # With start_offset the bag's /tf_static (recorded once, at its start)
-        # is never played; this publishes it, latched, from the bag itself
-        Node(
-            package="latentdrive_ros", executable="publish_tf_static.py", name="tf_static_from_bag",
-            arguments=[arg("bag")], output="log",
-        ),
+        OpaqueFunction(function=bag_nodes),
         # The node needs a few seconds to deserialize the engine and warm it
         # up; frames played before that are lost and the first plans would
         # wait for a full 1.5 s history anyway. /tf_static is played latched
-        # (qos_override.yaml) so the overlay finds the camera extrinsics
+        # (qos_override.yaml) so the overlay finds the camera extrinsics, and
+        # so is a route recorded later in the bag (a reroute)
         TimerAction(period=arg("play_delay"), actions=[
             ExecuteProcess(
                 cmd=["ros2", "bag", "play", arg("bag"), "--clock", "--rate", arg("rate"),
@@ -122,7 +150,7 @@ def generate_launch_description():
                      "--topics", *cameras,
                      "/sensing/camera/camera0/camera_info",
                      "/localization/kinematic_state", "/localization/acceleration",
-                     "/tf", "/tf_static", RECORDED_ROUTE_POINTS, RECORDED_PLAN],
+                     "/tf", "/tf_static", ROUTE, RECORDED_ROUTE_POINTS, RECORDED_PLAN],
                 output="screen",
             ),
         ]),

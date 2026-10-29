@@ -26,9 +26,13 @@ waypoints.
   frame still in flight, up to the tolerance; a slot that stays empty skips
   the plan or, with `missing_view_fill:=zeros`, gets the training's blank
   frame.
-- **Status.** Route points from the vehicle's recording
-  (`route_source:=recorded`, the plan waits for the tick's message) or from a
-  map-frame `route.npy` (`route_source:=file`, built like the vehicle does);
+- **Status.** Route points from the mission-planning route
+  (`route_source:=mission`: the route's lanelet centerlines from
+  `lanelet_map`, a JSON of `scripts/convert_map.py`, built like the vehicle
+  does), from the vehicle's recording (`route_source:=recorded`, the plan
+  waits for the tick's message) or from a map-frame `route.npy`
+  (`route_source:=file`). The ego is the odometry stamped nearest the frame,
+  what the vehicle's planner saw (a bag plays the frames ~0.1 s late);
   motion terms from differenced poses (`motion_source:=pose_difference`) or
   the twist/acceleration topics.
 
@@ -39,6 +43,7 @@ waypoints.
 | sub | `camera_topics[0..V-1]` (camera0, camera3, camera4 `image_raw/compressed`) | CompressedImage | views, view 0 first |
 | sub | `/localization/kinematic_state` | nav_msgs/Odometry | ego pose + velocity |
 | sub | `/localization/acceleration` | AccelWithCovarianceStamped | ego acceleration |
+| sub | `/planning/mission_planning/route` | autoware_planning_msgs/LaneletRoute | `route_source:=mission` only; transient local |
 | sub | `/tensorrt_e2e/debug/latentdrive/route_points` | geometry_msgs/PoseArray | `route_source:=recorded` only |
 | sub | view-0 `camera_info`, `/tf`, `/tf_static` | | camera overlay, when no `calibration_file` |
 | pub | `~/plan` | nav_msgs/Path | the raw engine output, base_link |
@@ -50,8 +55,8 @@ waypoints.
 
 `engine_file`; `camera_topics` (string array); `view_tolerance_s` (0.05),
 `history_tolerance_s` (0.05), `missing_view_fill` (skip | zeros),
-`max_rate_hz` (10); `route_source` (recorded | file), `route_file`,
-`recorded_route_points_topic`, `route_points_m` (empty = 5..50 m or 50 m from
+`max_rate_hz` (10); `route_source` (mission | recorded | file),
+`lanelet_map`, `route_topic`, `route_file`, `recorded_route_points_topic`, `route_points_m` (empty = 5..50 m or 50 m from
 the engine), `route_reversal_deg` (120); `motion_source` (pose_difference |
 twist); `odom_topic`, `accel_topic`; `calibration_file` + `scene_match`
 (overlay from a hand-off calibration.json instead of the bag); `smooth_alpha`
@@ -73,8 +78,9 @@ it is not installed system-wide. The launch arguments are listed in
 Scripts: `export_route.py <bag_dir>` writes the driven path as `route.npy` for
 `route_source:=file` (reads the `.mcap` files directly; run it with
 `uv run --with mcap --with mcap-ros2-support --with numpy`);
-`publish_tf_static.py <bag_dir>` latches the bag's `/tf_static` for a replay
-that starts past it (the launch runs it); `grab_viz.py --count N` saves N
+`publish_latched.py <bag_dir> --start-offset S` latches the bag's `/tf_static`
+and the route in effect at S for a replay that starts past them (the launch
+runs it); `grab_viz.py --count N` saves N
 frames of `~/viz` as PNGs (headless check).
 
 ## Live window from a container (X11)

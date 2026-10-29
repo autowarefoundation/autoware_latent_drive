@@ -116,14 +116,16 @@ embedding the library: ~100 lines from frames + odometry to a plan.
 ```bash
 cd ros2 && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release && cd ..   # once
 samples/rosbag/prepare_bag.sh /bags/<bag_dir> /data/bags/my_bag          # once per bag: metadata.yaml
+scripts/convert_map.py /maps/<map_dir> /data/maps/my_map.json                 # once per map
 samples/rosbag/run_replay.sh /data/bags/my_bag models/engine/camfront3-rptw-lane2-e1-mixed.engine \
-    start_offset:=60
+    lanelet_map:=/data/maps/my_map.json start_offset:=60
 ```
 
 The node subscribes to the cameras, odometry and acceleration the bag plays,
-takes the route points the vehicle recorded (or builds them from a
-`route.npy`), and publishes the plan plus a camera + BEV image; RViz shows it
-next to the plan the vehicle drove with.
+builds the route points from the bag's mission-planning route on the map's
+lanelet centerlines like the vehicle does (or takes the ones a LatentDrive
+run recorded, or a `route.npy`), and publishes the plan plus a camera + BEV
+image; RViz shows it next to the plan the vehicle drove with.
 
 ## Commands
 
@@ -268,6 +270,11 @@ does (and `planner_io.ego_status` in training), with no ROS dependency:
   the original single-subgoal rule, 50 m ahead.
   `BuildWithRoutePoints` takes map-frame points directly instead -- e.g. the
   ones the vehicle recorded on `/tensorrt_e2e/debug/latentdrive/route_points`.
+  On the vehicle the polyline is the mission route's preferred lanelets'
+  centerlines (5 m fine centerlines from the map loader), joined and cut at
+  the goal; `scripts/convert_map.py` writes those centerlines from a
+  `lanelet2_map.osm`, and the ROS node (`route_source:=mission`) and
+  `export_clip.py --lanelet_map` build the same polyline from them.
 - **Motion terms**: the training differenced recorded positions: velocity is
   the chord over the last 0.2 s and acceleration its change over 0.1 s, both in
   the current ego frame (`MotionSource::kPoseDifference`, the default). On a
@@ -331,7 +338,7 @@ src/cpp/
                 StatusBuilderImpl (route points, motion terms)
   visualizer/   BevVisualizerImpl, CameraProjectorImpl
   main/         gflags mode dispatch (build-engine, run-package, visualize)
-scripts/        build.sh: library, tests, ROS 2 package and engines in one go
+scripts/        build.sh (library, tests, ROS 2 package, engines), convert_map.py (lanelet2 map -> route centerlines)
 tests/          ctest unit tests (view window, status builder)
 samples/
   sample_data/  export_clip.py (rosbag -> clip), run_clip.cpp (latentdrive-sample-clip)
