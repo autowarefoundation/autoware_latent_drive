@@ -20,7 +20,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, TimerAction
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, SetEnvironmentVariable,
+                            TimerAction)
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -62,7 +63,16 @@ def generate_launch_description():
     arg = LaunchConfiguration
     cameras = [arg("camera0"), arg("camera1"), arg("camera2")]
     qos_override = os.path.join(share, "config", "qos_override.yaml")
-    return LaunchDescription([
+    # Fast DDS (humble's default RMW) sends a ~1 MB camera frame as fragmented
+    # UDP once it outgrows the default shared-memory segment, and with the
+    # usual 208 KB socket buffer whole stretches of frames are lost. This
+    # profile keeps them on shared memory; a profile set by the caller wins,
+    # and other RMWs ignore the variable
+    fastdds = []
+    if "FASTRTPS_DEFAULT_PROFILES_FILE" not in os.environ:
+        fastdds = [SetEnvironmentVariable("FASTRTPS_DEFAULT_PROFILES_FILE",
+                                          os.path.join(share, "config", "fastdds_replay.xml"))]
+    return LaunchDescription(fastdds + [
         DeclareLaunchArgument("bag", description="rosbag directory to replay (with metadata.yaml)"),
         DeclareLaunchArgument("engine", description="TensorRT engine file"),
         DeclareLaunchArgument("calibration", default_value="",

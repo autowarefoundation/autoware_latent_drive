@@ -71,11 +71,18 @@ Topics: `/latentdrive_node/plan` (nav_msgs/Path, base_link, the raw engine
 output), `/latentdrive_node/plan_map` and `/latentdrive_node/route_points`
 (map frame), `/latentdrive_node/viz/compressed` (camera ribbon + BEV).
 
-### On a laptop
+### Lost frames
 
-Three 2880x1860 JPEG streams at 10 Hz plus the engine are a desktop load.
-On a laptop RTX 4060 / i7-13700H the decodes fell behind under the GPU's power
-draw and 15-20 % of the plans were skipped at `rate:=1.0`; at `rate:=0.5`
-none were. The node paces on the bag's stamps, so a slower playback gives the
-same plans. The vehicle's own node (autoware_tensorrt_e2e) holds 10 Hz with
-none skipped on the vehicle computer.
+`replay.launch.py` points Fast DDS at `config/fastdds_replay.xml`, which keeps
+the ~1 MB camera frames on shared memory. Without it they go out as
+fragmented UDP, the default 208 KB socket buffer overflows and whole seconds
+of frames are lost: the log shows `camera stamp jumped ... s` and most plans
+are skipped (70 % on an RTX 4090 desktop, with 32 idle cores). A profile set
+in `FASTRTPS_DEFAULT_PROFILES_FILE` before the launch is used instead; if
+yours does not enlarge the shared-memory segment, expect the same.
+
+With it, the 09-30 bag plays at `rate:=1.0` with 0 skipped on the desktop
+(engine 13.8 ms). On a laptop RTX 4060 / i7-13700H the decodes still fell
+behind under the GPU's power draw and 15-20 % of the plans were skipped at
+`rate:=1.0`; at `rate:=0.5` none were. The node paces on the bag's stamps, so
+a slower playback gives the same plans.
