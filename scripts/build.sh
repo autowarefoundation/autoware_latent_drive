@@ -5,7 +5,7 @@
 #
 #   scripts/build.sh [onnx ...]
 #
-#   scripts/build.sh                                  # the default camfront3 lane2 export
+#   scripts/build.sh                                  # camfront3-rptw-lane2-e1.onnx, found under models/onnx/
 #   scripts/build.sh models/onnx/single-camera/.../camfront-rptw-lane2-e1.onnx
 #   SKIP_ROS=1 scripts/build.sh                       # no ROS install: library + engines only
 #
@@ -24,14 +24,19 @@ set -eo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 BUILD_DIR=${BUILD_DIR:-$REPO/build}
 ENGINE_DIR=${ENGINE_DIR:-$REPO/models/engine}
-DEFAULT_ONNX=$REPO/models/onnx/multi-camera/closed-loop-best/onnx/camfront3-rptw-lane2-e1.onnx
+DEFAULT_ONNX_NAME=camfront3-rptw-lane2-e1.onnx
 JOBS=$(nproc)
 
 step() { echo -e "\n=== $*"; }
 
-# Check the ONNX files before spending minutes on the builds
+# Check the ONNX files before spending minutes on the builds. The default is
+# looked up by name anywhere under models/onnx/, whose layout varies by machine
 ONNX=("$@")
-[ ${#ONNX[@]} -gt 0 ] || ONNX=("$DEFAULT_ONNX")
+if [ ${#ONNX[@]} -eq 0 ]; then
+  default=$(find -L "$REPO/models/onnx" -name "$DEFAULT_ONNX_NAME" 2>/dev/null | head -1)
+  [ -n "$default" ] || { echo "no $DEFAULT_ONNX_NAME under $REPO/models/onnx: pass the ONNX files to build" >&2; exit 1; }
+  ONNX=("$default")
+fi
 for onnx in "${ONNX[@]}"; do
   [ -f "$onnx" ] || { echo "no ONNX at $onnx" >&2; exit 1; }
 done
