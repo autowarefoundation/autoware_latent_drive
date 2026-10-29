@@ -1,122 +1,85 @@
 # latentdrive_ros
 
-Minimal ROS 2 (Jazzy) node for **open-loop rosbag replay** of the LatentDrive
-planner: replay a bag, run the engine live on the front camera + ego state, and
-publish the plan plus a camera-overlay + BEV visualization.
+Minimal ROS 2 node (humble or jazzy) for **open-loop rosbag replay** of the
+LatentDrive planner: play a bag, run the engine live on the cameras + ego
+state, publish the plan and draw it on the front camera image -- in a window
+and/or an mp4. It links the parent repo's library (`Planner`, `ViewWindow`,
+`StatusBuilder`, `CameraProjector`); no Autoware packages are needed. The
+step-by-step usage is the rosbag sample,
+[`samples/rosbag`](../../samples/rosbag).
 
-It links the parent repo's inference/visualizer core (`Planner`, `FrameWindow`,
-`BevVisualizer`, `CameraProjector`) — no autoware packages required.
+The engine sets the contract and the node follows it: 1 view (CAM_FRONT) or 3
+(CAM_FRONT, FRONT_LEFT, FRONT_RIGHT; 2 for the older wide + telephoto),
+status `[1, 6]` (one subgoal) or `[1, 16]` (six route points), 8 or 40
+waypoints.
+
+## How it plans
+
+- **Threads.** Each camera has its own executor thread, which decodes and
+  preprocesses its frames and pushes them into the window; a planning thread
+  runs the engine; a drawing thread draws the overlay and owns the window. A
+  camera callback never waits for an inference (the vehicle node's decode
+  thread + tick thread split).
+- **Tick.** One plan per view-0 frame, paced on the frame stamps to at most
+  `max_rate_hz` (the vehicle node's `tick_trigger:=camera`).
+- **Side views.** For each history slot, each side view's frame nearest the
+  front frame, within `view_tolerance_s`. The newest slot waits for a side
+  frame still in flight, up to the tolerance; a slot that stays empty skips
+  the plan or, with `missing_view_fill:=zeros`, gets the training's blank
+  frame.
+- **Status.** The route points are the ones the vehicle's planner fed its
+  model, recorded in the bag (`route_points_topic`, default
+  `/tensorrt_e2e/debug/latentdrive/route_points`); the plan waits for the
+  tick's message. The ego is the odometry stamped nearest the frame, what the
+  vehicle's planner saw (a bag plays the frames ~0.1 s late); motion terms
+  from differenced poses (`motion_source:=pose_difference`) or the
+  twist/acceleration topics.
+- **Overlay.** The plan projected on the ground plane of the front image
+  (green = now, red = +4 s), with the intrinsics from the view-0
+  `camera_info` and the camera pose from `/tf_static`. Esc or q in the window
+  ends the node.
 
 ## Topics
 
 | direction | topic | type | note |
 |---|---|---|---|
-| sub | `/sensing/camera/camera1/image_raw/compressed` | CompressedImage | front camera (CAM_FRONT_WIDE), 10 Hz |
+| sub | `camera_topics[0..V-1]` (camera0, camera3, camera4 `image_raw/compressed`) | CompressedImage | views, view 0 first |
 | sub | `/localization/kinematic_state` | nav_msgs/Odometry | ego pose + velocity |
-| sub | `/localization/acceleration` | geometry_msgs/AccelWithCovarianceStamped | ego acceleration |
-| pub | `~/viz` | sensor_msgs/Image | camera ribbon + BEV panel |
-| pub | `~/plan` | nav_msgs/Path | predicted trajectory (base_link) |
-
-The **subgoal** (route point 50 m ahead) is read from `route.npy` — the ego's
-own driven path exported from the bag — because the container has no
-`autoware_planning_msgs` to parse `/planning/trajectory`. For open-loop replay
-the whole run is known, so this is a faithful route target.
-
-## One-time prep (inside the deployment container)
-
-```bash
-# 1. the raw .db3 has no metadata.yaml; let ros2 build it
-ros2 bag reindex /path/to/bag_dir -s sqlite3
-
-# 2. export the ego route (needs the rosbags python lib; the host venv has it)
-python3 export_route.py /path/to/bag_dir          # -> bag_dir/route.npy
-```
-
-## Build
-
-Inside the container (`deployment/` image of the parent repo), with the repo
-mounted at `/workspace`:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-cd /workspace/ros2 && colcon build --paths latentdrive_ros
-source install/setup.bash
-```
-
-## Run
-
-```bash
-# terminal A: the node
-ros2 run latentdrive_ros latentdrive_node --ros-args \
-    -p engine_file:=/workspace/models/engine/e2e-wp10hz-fp16-mixed.engine \
-    -p calibration_file:=/workspace/sample_data/calibration.json \
-    -p route_file:=/path/to/bag_dir/route.npy
-
-# terminal B: play the bag
-ros2 bag play /path/to/bag_dir --topics \
-    /sensing/camera/camera1/image_raw/compressed \
-    /localization/kinematic_state /localization/acceleration
-
-# view it
-ros2 run rqt_image_view rqt_image_view /latentdrive_node/viz
-```
-
-Or both together via the launch file:
-
-```bash
-ros2 launch latentdrive_ros replay.launch.py \
-    bag:=/path/to/bag_dir \
-    engine:=/workspace/models/engine/e2e-wp10hz-fp16-mixed.engine \
-    calibration:=/workspace/sample_data/calibration.json \
-    route:=/path/to/bag_dir/route.npy
-```
-
-## Live window from the host (X11)
-
-To watch the camera + BEV window on your desktop, forward X11 into the
-container (the container's OpenCV is headless, so the window comes from
-`rqt_image_view`, which the launch file starts for you).
-
-From the host, in the repo root:
-
-```bash
-# 1. allow the container to reach your X server (once per login)
-xhost +local:docker
-
-# 2. start the container with X11 + the bag mounted (docker/run.sh does both).
-#    BAG is mounted at /bag, the repo at /workspace.
-BAG=/path/to/bag_dir ./docker/run.sh
-```
-
-Then inside the container shell it drops you into:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-source /workspace/ros2/install/setup.bash    # colcon build first if never built
-ros2 launch latentdrive_ros replay.launch.py \
-    bag:=/bag \
-    engine:=/workspace/models/engine/e2e-wp10hz-fp16-mixed.engine \
-    calibration:=/workspace/sample_data/calibration.json \
-    route:=/bag/route.npy
-```
-
-An `rqt_image_view` window pops up on your desktop showing the live camera
-ribbon + BEV. `display:=false` disables it (headless); `rate:=2.0` plays faster.
-
-Prep the bag once beforehand (see above): `ros2 bag reindex /bag -s sqlite3`
-and `export_route.py /bag`.
-
-**If the window doesn't appear:** re-run `xhost +local:docker` on the host and
-check `echo $DISPLAY` is non-empty before starting the container. `NO_X11=1`
-skips the X11 plumbing entirely.
-
-## Headless check
-
-`scripts/grab_viz.py --count N` saves N frames of `~/viz` as PNGs — useful over
-SSH or when no display is available.
+| sub | `/localization/acceleration` | AccelWithCovarianceStamped | ego acceleration |
+| sub | `/tensorrt_e2e/debug/latentdrive/route_points` | geometry_msgs/PoseArray | the route points fed to the model |
+| sub | view-0 `camera_info`, `/tf_static` | | camera overlay |
+| pub | `~/plan` | nav_msgs/Path | the raw engine output, base_link |
 
 ## Parameters
 
-`engine_file`, `calibration_file`, `route_file`, `camera_topic`, `odom_topic`,
-`accel_topic`, `scene_match` (calibration entry substring, default `prd_jt`),
-`subgoal_ahead_m` (default 50).
+`engine_file`; `camera_topics` (string array); `view_tolerance_s` (0.05),
+`history_tolerance_s` (0.05), `missing_view_fill` (skip | zeros),
+`max_rate_hz` (10); `route_points_topic`; `motion_source` (pose_difference |
+twist); `odom_topic`, `accel_topic`; `smooth_alpha` (0.35, the drawn plan
+only); `show_window` (true), `out_video` (empty: no file), `viz_width` (1024:
+the drawn image is `viz_width` x `viz_width / 2`).
+
+## Build and run
+
+```bash
+source /opt/ros/<distro>/setup.bash
+cd ros2 && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+ros2 launch latentdrive_ros replay.launch.py bag:=/path/to/bag engine:=/path/to.engine
+```
+
+`TENSORRT_ROOT` (env or `-DTENSORRT_ROOT`) points at a TensorRT tarball when
+it is not installed system-wide. The launch arguments are listed in
+[`samples/rosbag/README.md`](../../samples/rosbag/README.md).
+
+`scripts/publish_tf_static.py <bag_dir>` latches the bag's `/tf_static` for a
+replay that starts past it (the launch runs it).
+
+## Window from a container (X11)
+
+`xhost +local:docker` on the host once per login, then start the container
+with X11 forwarded (`BAG=/path/to/bag ./docker/run.sh` does both; the bag is
+mounted at `/bag`). If no window appears, re-run `xhost +local:docker` and
+check that `echo $DISPLAY` is non-empty before starting the container;
+`NO_X11=1` skips the X11 plumbing. Without a display, run with
+`show_window:=false out_video:=/path/to.mp4` and watch the file.

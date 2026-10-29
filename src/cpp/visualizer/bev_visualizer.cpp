@@ -1,5 +1,6 @@
 #include "bev_visualizer.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <opencv2/imgproc.hpp>
 #include <vector>
@@ -111,13 +112,23 @@ class BevVisualizerImpl : public BevVisualizer {
   }
 
   void DrawTrajectoryHorizon(const common::Trajectory &in_traj, int in_thickness) final {
+    if (in_traj.empty()) return;
+
+    // A dot per waypoint beads the line at 10 Hz and piles into a blob near
+    // the ego at low speed, so the plan is drawn as a bare line and only the
+    // whole-second poses are marked. `every` is the waypoints per second of
+    // the 4 s horizon: 10 for the 10 Hz engine, 2 for the 2 Hz one
+    const std::size_t every = std::max<std::size_t>(in_traj.size() / 4, 1);
+
     cv::Point prev = ToPx(0.f, 0.f);
     for (std::size_t i = 0; i < in_traj.size(); ++i) {
       const cv::Point  p    = ToPx(in_traj[i].x, in_traj[i].y);
-      const double     frac = static_cast<double>(i) / (in_traj.size() - 1);
+      const double     frac = static_cast<double>(i) / std::max<std::size_t>(in_traj.size() - 1, 1);
       const cv::Scalar c    = HorizonColor(frac);
       cv::line(canvas_, prev, p, c, in_thickness, cv::LINE_AA);
-      cv::circle(canvas_, p, in_thickness, c, cv::FILLED, cv::LINE_AA);
+      if ((i + 1) % every == 0) {
+        cv::circle(canvas_, p, in_thickness + 1, c, cv::FILLED, cv::LINE_AA);
+      }
       prev = p;
     }
   }

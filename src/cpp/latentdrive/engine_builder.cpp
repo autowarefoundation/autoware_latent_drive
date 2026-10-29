@@ -63,6 +63,59 @@ static int PinPlannerLayersFp32(INetworkDefinition &network) {
   return pinned;
 }
 
+// @brief: This function is used to pin a symbolic batch axis to 1. The older
+// exports carry fixed shapes ([1, 3, 4, 256, 512]); the newer ones -- the
+// closed-loop single-camera and the two-view models -- leave the batch axis
+// symbolic, and TensorRT refuses to build a network with a dynamic input
+// unless an optimization profile bounds it. The planner runs batch 1, so
+// min = opt = max = 1 makes the engine as specialised as a fixed export, and
+// the same rule covers the 6-D [B, V, 3, 4, H, W] input: only the leading axis
+// may be symbolic, the view count stays baked into the ONNX
+static bool FreezeBatchAxis(IBuilder &builder, INetworkDefinition &network,
+                            IBuilderConfig &config) {
+  IOptimizationProfile *profile = nullptr;
+  for (int i = 0; i < network.getNbInputs(); ++i) {
+    ITensor *input   = network.getInput(i);
+    Dims     dims    = input->getDimensions();
+    bool     dynamic = false;
+    for (int d = 0; d < dims.nbDims; ++d) {
+      if (dims.d[d] != -1) continue;
+      if (d != 0) {
+        LOGE("Input '%s' has a symbolic axis %d; only the batch axis may be dynamic",
+             input->getName(), d);
+        return false;
+      }
+      dims.d[d] = 1;
+      dynamic   = true;
+    }
+    if (!dynamic) continue;
+    if (!profile) profile = builder.createOptimizationProfile();
+    profile->setDimensions(input->getName(), OptProfileSelector::kMIN, dims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kOPT, dims);
+    profile->setDimensions(input->getName(), OptProfileSelector::kMAX, dims);
+    LOG("Froze the symbolic batch axis of '%s' to 1 (%d-D input)", input->getName(),
+        dims.nbDims);
+  }
+  if (profile && config.addOptimizationProfile(profile) < 0) {
+    LOGE("addOptimizationProfile failed");
+    return false;
+  }
+
+  // Say which contract was parsed, so a wrong ONNX is caught before the
+  // minute-long build rather than at node start
+  for (int i = 0; i < network.getNbInputs(); ++i) {
+    const ITensor *input = network.getInput(i);
+    if (std::strcmp(input->getName(), kVideoTensorName) != 0) continue;
+    const Dims dims = input->getDimensions();
+    if (dims.nbDims == 6) {
+      LOG("Video input is 6-D: %ld camera views", static_cast<long>(dims.d[1]));
+    } else {
+      LOG("Video input is %d-D: single camera view", dims.nbDims);
+    }
+  }
+  return true;
+}
+
 bool BuildEngine(const BuildParams &params) {
   auto logger = logger::CreateLogger(logger::Level::kINFO);
 
@@ -85,6 +138,8 @@ bool BuildEngine(const BuildParams &params) {
     return false;
   }
   LOG("Parsed %s (%d layers)", params.onnx_path.c_str(), network->getNbLayers());
+
+  if (!FreezeBatchAxis(*builder, *network, *config)) return false;
 
   // Set the quantization flags (the TensorRT 8 platformHasFastFp16 probe is
   // deprecated in 10.x -- every supported GPU has fast fp16)

@@ -133,3 +133,37 @@ target_link_libraries(${PROJECT_NAME} PRIVATE latentdrive)
 set_target_properties(
   ${PROJECT_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
                              OUTPUT_NAME ${PROJECT_NAME})
+
+# ==============================================================================
+# Samples
+# ==============================================================================
+# samples/sample_data: the offline pipeline on a clip cut from a rosbag
+# (export_clip.py), with the library API alone. The rosbag sample is the ROS 2
+# package under ros2/ and builds with colcon
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/samples/sample_data/run_clip.cpp
+                            PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
+add_executable(latentdrive-sample-clip ${CMAKE_CURRENT_SOURCE_DIR}/samples/sample_data/run_clip.cpp)
+target_link_libraries(latentdrive-sample-clip PRIVATE latentdrive)
+set_target_properties(latentdrive-sample-clip PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ==============================================================================
+# Unit tests (ctest)
+# ==============================================================================
+# Plain-assert tests of the preprocessing window (history picked by nearest
+# stamp, cross-view alignment within tolerance, the [V, 3, T, H, W] layout,
+# the blank fill) and of the status builder (route points, motion terms).
+# They need no GPU; `ctest --test-dir build` runs them after the build
+option(BUILD_TESTING "Build the unit tests" ON)
+if(BUILD_TESTING)
+  enable_testing()
+  file(GLOB TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+  # One executable and one ctest entry per test file
+  foreach(CXX_FILE ${TEST_SRC})
+    set_source_files_properties(${CXX_FILE} PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
+    get_filename_component(TEST_NAME ${CXX_FILE} NAME_WE)
+    add_executable(${TEST_NAME} ${CXX_FILE})
+    target_link_libraries(${TEST_NAME} PRIVATE latentdrive)
+    set_target_properties(${TEST_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+  endforeach()
+endif()

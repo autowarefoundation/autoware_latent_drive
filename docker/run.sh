@@ -17,10 +17,10 @@
 #   GPUS    value for --gpus (default all)
 #   NAME    container name; when set the container is kept after exit and a
 #           second invocation execs into the running one. Unset means --rm.
-#   NO_X11=1  skip X11 forwarding (no GUI windows like rqt_image_view)
+#   NO_X11=1  skip X11 forwarding (no window for the replay's camera overlay)
 #
-# For live GUI windows (rqt_image_view) run `xhost +local:docker` on the host
-# once, then start with X11 forwarded (the default here).
+# For the replay's window run `xhost +local:docker` on the host once, then
+# start with X11 forwarded (the default here).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,8 +40,8 @@ fi
 
 args=(
     --gpus "$GPUS"
-    # ROS 2 nodes + rqt talk over localhost/shared-memory DDS; host net + shm
-    # keep discovery and large image transport happy
+    # ROS 2 nodes talk over localhost/shared-memory DDS; host net + shm keep
+    # discovery and large image transport happy
     --network host
     --ipc host
     --shm-size 8g
@@ -64,8 +64,8 @@ if [ -z "${DATA:-}" ] && [ -z "${BAG:-}" ]; then
     echo "      DATA=/path/to/workspace (CLI) or a rosbag with BAG=/path (ROS 2)." >&2
 fi
 
-# X11 for GUI windows (rqt_image_view). Run `xhost +local:docker` once on the
-# host if the display is refused.
+# X11 for the replay's window. Run `xhost +local:docker` once on the host if
+# the display is refused.
 if [ -z "${NO_X11:-}" ] && [ -n "${DISPLAY:-}" ]; then
     args+=(-e "DISPLAY=$DISPLAY" -v /tmp/.X11-unix:/tmp/.X11-unix:ro)
     if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then

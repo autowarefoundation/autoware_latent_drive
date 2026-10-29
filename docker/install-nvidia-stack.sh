@@ -89,7 +89,7 @@ curl -fsSL -o /tmp/spconv.deb "${BASE_URL}/spconv_${SPCONV_VERSION}_amd64.deb"
 apt-get install -y /tmp/cumm.deb /tmp/spconv.deb
 rm -f /tmp/cumm.deb /tmp/spconv.deb
 
-# --- GPU vendor ICDs (from the cuda role), so rviz2 / OpenGL / OpenCL see the GPU ---
+# --- GPU vendor ICDs (from the cuda role), so OpenGL / OpenCL see the GPU ---
 mkdir -p /etc/vulkan/icd.d /etc/glvnd/egl_vendor.d /etc/OpenCL/vendors
 curl -fsSL -o /etc/vulkan/icd.d/nvidia_icd.json \
   https://gitlab.com/nvidia/container-images/vulkan/raw/dc389b0445c788901fda1d85be96fd1cb9410164/nvidia_icd.json
