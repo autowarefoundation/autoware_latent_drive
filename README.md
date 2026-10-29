@@ -5,13 +5,17 @@ video, six points along the route and the ego motion in, a 4 s ego trajectory ou
 no ROS dependency, an offline sample and a ROS 2 node that replays a rosbag and draws the plan on the front
 camera.
 
-![Six scenes with the plan projected on the front camera](docs/latent_drive_scenes.png)
+<p align="center">
+  <img src="docs/latent_drive_scenes.png" width="100%" alt="Six scenes with the plan projected on the front camera">
+</p>
 
-![Open-loop replay of the six scenes, at twice the speed](docs/demo.gif)
+<p align="center">
+  <img src="docs/demo.gif" width="640" alt="Open-loop replay of the six scenes, at twice the speed">
+</p>
 
-Open-loop replays of recorded drives with the three-camera model (shown at 2x; the full video is on
-[Hugging Face](https://huggingface.co/AutowareFoundation/latent_drive)). The ribbon is the plan, green (now)
-to red (+4 s); it is drawn, not executed.
+Open-loop replays of recorded drives with the three-camera model, every 10 Hz frame shown at 2x (the full
+video is on [Hugging Face](https://huggingface.co/AutowareFoundation/latent_drive)). The ribbon is the plan,
+green (now) to red (+4 s); it is drawn, not executed.
 
 ## Models
 
