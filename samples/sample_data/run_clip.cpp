@@ -52,7 +52,8 @@ DEFINE_string(engine_file, "", "Serialized TensorRT engine (latentdrive-trt --mo
 DEFINE_string(clip_dir, "", "Clip directory written by export_clip.py");
 DEFINE_string(route_source, "",
               "recorded: the vehicle's route points (route_points.npy); file: build them from route.npy. "
-              "Default: recorded when the clip has them");
+              "Default: file when route.npy is the mission-planning route (export_clip.py --lanelet_map), "
+              "else recorded when the clip has them");
 DEFINE_string(missing_view_fill, "skip",
               "A side-view slot without a frame within --view_tolerance_s: skip the step or zeros "
               "(the blank frame the camfront3 training used)");
@@ -174,8 +175,10 @@ int main(int argc, char **argv) {
   builder->SetRoute(route);
 
   utils::NpyArray recorded;
-  const bool      has_recorded = clip.contains("route_points") && !clip["route_points"].is_null();
-  std::string     route_source = FLAGS_route_source.empty() ? (has_recorded ? "recorded" : "file") : FLAGS_route_source;
+  const bool        has_recorded = clip.contains("route_points") && !clip["route_points"].is_null();
+  const std::string route_kind   = clip.value("route_kind", "driven");
+  std::string       route_source = FLAGS_route_source;
+  if (route_source.empty()) route_source = route_kind == "mission" || !has_recorded ? "file" : "recorded";
   if (route_source == "recorded") {
     if (!has_recorded) LOGF("--route_source=recorded, but the clip has no route_points.npy");
     recorded = utils::LoadNpy((clip_dir / clip["route_points"].get<std::string>()).string());
@@ -196,7 +199,8 @@ int main(int argc, char **argv) {
 
   LOG("Clip %s: %.0f s, %zu front frames, %d view%s, status [1, %d] with route points from %s",
       clip_dir.c_str(), clip["duration_s"].get<double>(), frames[0].size(), num_views, num_views == 1 ? "" : "s",
-      planner->StatusDim(), route_source == "recorded" ? "the vehicle (route_points.npy)" : "route.npy");
+      planner->StatusDim(),
+      route_source == "recorded" ? "the vehicle (route_points.npy)" : ("route.npy (" + route_kind + " route)").c_str());
 
   auto                                         bev       = visualizer::CreateBevVisualizer();
   auto                                         projector = ProjectorFrom(clip["camera"]);
@@ -235,7 +239,13 @@ int main(int argc, char **argv) {
     last_tick = t;
     if (next_odom == 0 || t < 0.0) continue;  // the 2 s before the clip only fill the history
 
-    const float             *o = odom.data.data() + (next_odom - 1) * odom_cols;
+    // The ego: the odometry stamped nearest the frame, as the vehicle's
+    // planner sees it (the newest sample when the frame arrives, a few ms on)
+    std::size_t i_ego = next_odom - 1;
+    if (next_odom < odom.shape[0] && odom.data[next_odom * odom_cols] - t < t - odom.data[i_ego * odom_cols]) {
+      i_ego = next_odom;
+    }
+    const float             *o = odom.data.data() + i_ego * odom_cols;
     const status::PoseSample ego{o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]};
     status::StatusResult     st;
     if (route_source == "recorded") {

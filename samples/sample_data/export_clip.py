@@ -17,7 +17,10 @@ install needed) and writes a self-contained clip:
     odometry.npy       float32 [M, 8]: t, x, y, yaw, vx, vy, ax, ay -- every
                        /localization/kinematic_state message (50 Hz), the
                        acceleration from /localization/acceleration (nearest)
-    route.npy          float32 [N, 2]: a route polyline in the map frame -- the
+    route.npy          float32 [N, 2]: a route polyline in the map frame. With
+                       --lanelet_map, the vehicle's route as its planner built it:
+                       the bag's mission-planning route (LaneletRoute) on the
+                       lanelet centerlines of scripts/convert_map.py. Without, the
                        ego's driven path from the clip start to --route-ahead
                        seconds past its end, one point every 0.5 m
     route_points.npy   float32 [T, 1 + 2K]: t, x1, y1, ..., xK, yK -- the route
@@ -35,12 +38,16 @@ import sys
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+from convert_map import route_polyline  # noqa: E402
 from mcap.reader import make_reader
 from mcap_ros2.decoder import DecoderFactory
 
 ODOM = "/localization/kinematic_state"
 ACCEL = "/localization/acceleration"
 ROUTE_POINTS = "/tensorrt_e2e/debug/latentdrive/route_points"
+ROUTE = "/planning/mission_planning/route"
 TF_STATIC = "/tf_static"
 DEFAULT_VIEWS = ["camera0", "camera3", "camera4"]  # CAM_FRONT, FRONT_LEFT, FRONT_RIGHT on prd_jt
 VIEW_NAMES = ["front", "front_left", "front_right"]
@@ -123,6 +130,28 @@ def crop_resize(bgr):
     return cv2.resize(bgr, (INPUT_W, INPUT_H), interpolation=cv2.INTER_LINEAR)
 
 
+def mission_route(files, bag_start, t0, lanelet_map):
+    """The route in effect at the clip start (the last LaneletRoute at or
+    before it, else the first after) on the lanelet centerlines, map frame"""
+    route = None
+    for _, log_time, msg in messages(files, [ROUTE], bag_start):
+        if route is not None and log_time > t0:
+            break
+        route = msg
+    if route is None:
+        sys.exit(f"--lanelet_map: no {ROUTE} in the bag")
+    with open(lanelet_map) as fh:
+        centerlines = json.load(fh)["lanelets"]
+    ids = [s.preferred_primitive.id for s in route.segments]
+    poly, missing = route_polyline(centerlines, ids, (route.goal_pose.position.x, route.goal_pose.position.y))
+    if len(poly) < 2:
+        sys.exit(f"none of the route's {len(ids)} lanelets is in {lanelet_map}: the route was planned on another map")
+    if missing:
+        print(f"WARNING: {len(missing)} of the route's {len(ids)} lanelets are not in {lanelet_map} (first: "
+              f"{missing[0]}): planned on another map revision; those stretches are bridged with straight lines")
+    return poly
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("bag_dir")
@@ -133,6 +162,9 @@ def main():
                     help="camera names (or full topics), view 0 first; default camera0,camera3,camera4")
     ap.add_argument("--route-ahead", type=float, default=30.0,
                     help="seconds of driven path past the clip end kept in route.npy")
+    ap.add_argument("--lanelet_map", default=None,
+                    help="lanelet centerlines (scripts/convert_map.py): route.npy from the bag's "
+                         "mission-planning route instead of the driven path")
     ap.add_argument("--full-res", action="store_true", help="keep the recorded JPEGs instead of 512x256 crops")
     ap.add_argument("--jpeg-quality", type=int, default=95)
     a = ap.parse_args()
@@ -233,17 +265,21 @@ def main():
         rows.append((rel(t), x - origin[0], y - origin[1], yaw, vx, vy, ax, ay))
     np.save(os.path.join(a.out_dir, "odometry.npy"), np.asarray(rows, dtype=np.float32))
 
-    # driven path from the clip start on, one point every 0.5 m
-    path = []
-    for t, x, y, *_ in odom:
-        if t < t0:
-            continue
-        p = (x - origin[0], y - origin[1])
-        if not path or np.hypot(p[0] - path[-1][0], p[1] - path[-1][1]) >= 0.5:
-            path.append(p)
+    if a.lanelet_map:
+        path, route_kind = mission_route(files, bag_start, t0, a.lanelet_map), "mission"
+        path = [(x - origin[0], y - origin[1]) for x, y in path]
+    else:
+        # driven path from the clip start on, one point every 0.5 m
+        path, route_kind = [], "driven"
+        for t, x, y, *_ in odom:
+            if t < t0:
+                continue
+            p = (x - origin[0], y - origin[1])
+            if not path or np.hypot(p[0] - path[-1][0], p[1] - path[-1][1]) >= 0.5:
+                path.append(p)
     np.save(os.path.join(a.out_dir, "route.npy"), np.asarray(path, dtype=np.float32))
     length = float(np.sum(np.linalg.norm(np.diff(np.asarray(path), axis=0), axis=1))) if len(path) > 1 else 0.0
-    print(f"route.npy: driven path, {len(path)} points, {length:.0f} m")
+    print(f"route.npy: {route_kind} route, {len(path)} points, {length:.0f} m")
 
     route_points_file = None
     if rpoints:
@@ -270,6 +306,7 @@ def main():
         "camera": camera,
         "odometry": "odometry.npy",
         "route": "route.npy",
+        "route_kind": route_kind,
         "route_points": route_points_file,
     }
     with open(os.path.join(a.out_dir, "clip.json"), "w") as fh:
