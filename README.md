@@ -5,6 +5,12 @@ video, six points along the route and the ego motion in, a 4 s ego trajectory ou
 no ROS dependency, an offline sample and a ROS 2 node that replays a rosbag and draws the plan on the front
 camera.
 
+**LatentDrive is built on a latent world model.** Its video encoder is a V-JEPA ViT-L, a self-supervised world
+model that learns how driving scenes look and evolve by predicting masked parts of the video in its own latent
+space rather than in pixels, pretrained on driving video. The planner plans in that latent space: a small
+planning head reads the world model's latent features of the camera frames together with the route and the ego
+state, with no object detection or tracking in between.
+
 <p align="center">
   <img src="docs/latent_drive_scenes.png" width="100%" alt="Six scenes with the plan projected on the front camera">
 </p>
