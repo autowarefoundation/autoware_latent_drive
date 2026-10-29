@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Run the planner on a rosbag: the latentdrive_ros node, the bag player and
-# RViz in one go (ros2/latentdrive_ros/launch/replay.launch.py).
+# Run the planner on a rosbag: the latentdrive_ros node and the bag player in
+# one go (ros2/latentdrive_ros/launch/replay.launch.py); the plan is drawn on
+# the front camera in a window and, with out_video:=, written to an mp4.
 #
 #   run_replay.sh <bag_dir> <engine> [launch_arg:=value ...]
 #
 #   run_replay.sh /bags/1551 models/engine/camfront3-rptw-lane2-e1-mixed.engine
 #   run_replay.sh /bags/1551 E.engine start_offset:=60 rate:=0.5
-#   run_replay.sh /bags/0930 E.engine route_source:=file route:=/bags/0930/route.npy
+#   run_replay.sh /bags/1551 E.engine show_window:=false out_video:=/bags/1551/replay.mp4
 #
 # <bag_dir> must be playable (metadata.yaml): run prepare_bag.sh on the
 # vehicle's .mcap directory once. The package must be built (colcon, see

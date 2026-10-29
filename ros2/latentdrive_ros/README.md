@@ -2,9 +2,10 @@
 
 Minimal ROS 2 node (humble or jazzy) for **open-loop rosbag replay** of the
 LatentDrive planner: play a bag, run the engine live on the cameras + ego
-state, publish the plan and a camera-overlay + BEV image. It links the parent
-repo's library (`Planner`, `ViewWindow`, `StatusBuilder`, the visualizers);
-no Autoware packages are needed. The step-by-step usage is the rosbag sample,
+state, publish the plan and draw it on the front camera image -- in a window
+and/or an mp4. It links the parent repo's library (`Planner`, `ViewWindow`,
+`StatusBuilder`, `CameraProjector`); no Autoware packages are needed. The
+step-by-step usage is the rosbag sample,
 [`samples/rosbag`](../../samples/rosbag).
 
 The engine sets the contract and the node follows it: 1 view (CAM_FRONT) or 3
@@ -16,9 +17,9 @@ waypoints.
 
 - **Threads.** Each camera has its own executor thread, which decodes and
   preprocesses its frames and pushes them into the window; a planning thread
-  runs the engine; a drawing thread renders the overlay. A camera callback
-  never waits for an inference (the vehicle node's decode thread + tick
-  thread split).
+  runs the engine; a drawing thread draws the overlay and owns the window. A
+  camera callback never waits for an inference (the vehicle node's decode
+  thread + tick thread split).
 - **Tick.** One plan per view-0 frame, paced on the frame stamps to at most
   `max_rate_hz` (the vehicle node's `tick_trigger:=camera`).
 - **Side views.** For each history slot, each side view's frame nearest the
@@ -26,15 +27,17 @@ waypoints.
   frame still in flight, up to the tolerance; a slot that stays empty skips
   the plan or, with `missing_view_fill:=zeros`, gets the training's blank
   frame.
-- **Status.** Route points from the mission-planning route
-  (`route_source:=mission`: the route's lanelet centerlines from
-  `lanelet_map`, a JSON of `scripts/convert_map.py`, built like the vehicle
-  does), from the vehicle's recording (`route_source:=recorded`, the plan
-  waits for the tick's message) or from a map-frame `route.npy`
-  (`route_source:=file`). The ego is the odometry stamped nearest the frame,
-  what the vehicle's planner saw (a bag plays the frames ~0.1 s late);
-  motion terms from differenced poses (`motion_source:=pose_difference`) or
-  the twist/acceleration topics.
+- **Status.** The route points are the ones the vehicle's planner fed its
+  model, recorded in the bag (`route_points_topic`, default
+  `/tensorrt_e2e/debug/latentdrive/route_points`); the plan waits for the
+  tick's message. The ego is the odometry stamped nearest the frame, what the
+  vehicle's planner saw (a bag plays the frames ~0.1 s late); motion terms
+  from differenced poses (`motion_source:=pose_difference`) or the
+  twist/acceleration topics.
+- **Overlay.** The plan projected on the ground plane of the front image
+  (green = now, red = +4 s), with the intrinsics from the view-0
+  `camera_info` and the camera pose from `/tf_static`. Esc or q in the window
+  ends the node.
 
 ## Topics
 
@@ -43,25 +46,18 @@ waypoints.
 | sub | `camera_topics[0..V-1]` (camera0, camera3, camera4 `image_raw/compressed`) | CompressedImage | views, view 0 first |
 | sub | `/localization/kinematic_state` | nav_msgs/Odometry | ego pose + velocity |
 | sub | `/localization/acceleration` | AccelWithCovarianceStamped | ego acceleration |
-| sub | `/planning/mission_planning/route` | autoware_planning_msgs/LaneletRoute | `route_source:=mission` only; transient local |
-| sub | `/tensorrt_e2e/debug/latentdrive/route_points` | geometry_msgs/PoseArray | `route_source:=recorded` only |
-| sub | view-0 `camera_info`, `/tf`, `/tf_static` | | camera overlay, when no `calibration_file` |
+| sub | `/tensorrt_e2e/debug/latentdrive/route_points` | geometry_msgs/PoseArray | the route points fed to the model |
+| sub | view-0 `camera_info`, `/tf_static` | | camera overlay |
 | pub | `~/plan` | nav_msgs/Path | the raw engine output, base_link |
-| pub | `~/plan_map` | nav_msgs/Path | the same in the map frame (through the ego pose it was planned from) |
-| pub | `~/route_points` | geometry_msgs/PoseArray | the route points fed to the model, map frame |
-| pub | `~/viz/compressed`, `~/viz` | CompressedImage, Image | camera ribbon + BEV; the raw one only while subscribed |
 
 ## Parameters
 
 `engine_file`; `camera_topics` (string array); `view_tolerance_s` (0.05),
 `history_tolerance_s` (0.05), `missing_view_fill` (skip | zeros),
-`max_rate_hz` (10); `route_source` (mission | recorded | file),
-`lanelet_map`, `route_topic`, `route_file`, `recorded_route_points_topic`, `route_points_m` (empty = 5..50 m or 50 m from
-the engine), `route_reversal_deg` (120); `motion_source` (pose_difference |
-twist); `odom_topic`, `accel_topic`; `calibration_file` + `scene_match`
-(overlay from a hand-off calibration.json instead of the bag); `smooth_alpha`
-(0.35, the drawn plan only), `viz_jpeg_quality`, `viz_reliable`, `viz_route_points`
-(true: the route points in the BEV panel).
+`max_rate_hz` (10); `route_points_topic`; `motion_source` (pose_difference |
+twist); `odom_topic`, `accel_topic`; `smooth_alpha` (0.35, the drawn plan
+only); `show_window` (true), `out_video` (empty: no file), `viz_width` (1024:
+the drawn image is `viz_width` x `viz_width / 2`).
 
 ## Build and run
 
@@ -76,20 +72,14 @@ ros2 launch latentdrive_ros replay.launch.py bag:=/path/to/bag engine:=/path/to.
 it is not installed system-wide. The launch arguments are listed in
 [`samples/rosbag/README.md`](../../samples/rosbag/README.md).
 
-Scripts: `export_route.py <bag_dir>` writes the driven path as `route.npy` for
-`route_source:=file` (reads the `.mcap` files directly; run it with
-`uv run --with mcap --with mcap-ros2-support --with numpy`);
-`publish_latched.py <bag_dir> --start-offset S` latches the bag's `/tf_static`
-and the route in effect at S for a replay that starts past them (the launch
-runs it); `publish_map.py <map.json>` draws the lanelet map around the car,
-the route's lanes and the ego box for RViz (the launch runs it with
-`lanelet_map:=`); `grab_viz.py --count N` saves N
-frames of `~/viz` as PNGs (headless check).
+`scripts/publish_tf_static.py <bag_dir>` latches the bag's `/tf_static` for a
+replay that starts past it (the launch runs it).
 
-## Live window from a container (X11)
+## Window from a container (X11)
 
 `xhost +local:docker` on the host once per login, then start the container
 with X11 forwarded (`BAG=/path/to/bag ./docker/run.sh` does both; the bag is
 mounted at `/bag`). If no window appears, re-run `xhost +local:docker` and
 check that `echo $DISPLAY` is non-empty before starting the container;
-`NO_X11=1` skips the X11 plumbing.
+`NO_X11=1` skips the X11 plumbing. Without a display, run with
+`show_window:=false out_video:=/path/to.mp4` and watch the file.

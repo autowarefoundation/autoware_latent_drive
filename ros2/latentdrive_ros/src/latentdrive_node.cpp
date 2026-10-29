@@ -1,9 +1,12 @@
 // Minimal ROS 2 node for open-loop rosbag replay of the LatentDrive planner.
 //
-// Subscribes to the cameras, ego odometry and acceleration; every view-0
-// (CAM_FRONT) frame triggers a plan: the timestamped window picks the four
-// history slots, the status builder makes the status vector, the engine runs,
-// and the node publishes the plan plus a camera+BEV visualization image.
+// Subscribes to the cameras, the ego odometry and acceleration, and the route
+// points the vehicle's planner fed its model (recorded in the bags of
+// LatentDrive runs on /tensorrt_e2e/debug/latentdrive/route_points). Every
+// view-0 (CAM_FRONT) frame triggers a plan: the timestamped window picks the
+// four history slots, the status builder makes the status vector, the engine
+// runs, and the node publishes the plan and draws it on the front camera
+// image -- in an OpenCV window and/or an mp4 file.
 //
 // The engine decides the contract, the node adapts:
 //   views         1 (CAM_FRONT), 2 (wide + telephoto) or 3 (camfront3: front,
@@ -31,24 +34,15 @@
 // most `max_rate_hz` (the vehicle node's `tick_trigger:=camera`). Arrival
 // times jitter by tens of milliseconds under bag playback; the stamps do not.
 //
-// Route (the status' route points), `route_source`:
-//   mission   the route from mission planning (autoware_planning_msgs/
-//             LaneletRoute on `route_topic`, in any Autoware bag) plus the
-//             map's lanelet centerlines (`lanelet_map`, a JSON written by
-//             scripts/convert_map.py from lanelet2_map.osm): the preferred
-//             lanelets' centerlines in route order, cut at the goal -- the
-//             polyline the vehicle's planner builds, then turned into route
-//             points the way it does (below)
-//   recorded  the route points the vehicle's planner fed the model, recorded
-//             in the bag on /tensorrt_e2e/debug/latentdrive/route_points (map
-//             frame) -- the same input the car saw, from its lanelet route
-//   file      a map-frame polyline from `route_file` (route.npy, e.g. the
-//             ego's driven path from scripts/export_route.py), turned into
-//             route points the way the vehicle does it (1 m resample, forward-
-//             hinted projection, clamp at the end)
-// Motion terms (`motion_source`): pose_difference (the training convention,
-// differenced positions 0.1 s apart) or twist (the odometry twist and the
-// acceleration topic).
+// Route points: the vehicle stamped the ones it fed its model with its tick,
+// a few tens of ms after the camera frame it planned on; a plan waits for the
+// message of its tick. Motion terms (`motion_source`): pose_difference (the
+// training convention, differenced positions 0.1 s apart) or twist (the
+// odometry twist and the acceleration topic).
+//
+// Overlay: the plan projected on the ground plane of the view-0 image, with
+// the intrinsics from the bag's camera_info and the camera pose from its
+// /tf_static (base_link -> camera).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -56,40 +50,33 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <unordered_map>
 #include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
-#include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
-#include <autoware_planning_msgs/msg/lanelet_route.hpp>
 #include <geometry_msgs/msg/accel_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <std_msgs/msg/header.hpp>
 
-#include "bev_visualizer.hpp"
 #include "camera_projector.hpp"
-#include "color_map.hpp"
 #include "frame_window.hpp"
-#include "npy.hpp"
 #include "planner.hpp"
 #include "status_builder.hpp"
 #include "trajectory.hpp"
@@ -99,29 +86,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// @brief: This function is used to load a scene entry from a calibration.json
-// (K_crop_resized for the 512x256 image and the camera-to-ego extrinsics) of
-// the hand-off package, returning a projector for the camera overlay
-std::shared_ptr<visualizer::CameraProjector> LoadProjector(const std::string &path,
-                                                           const std::string &match) {
-  std::ifstream f(path);
-  if (!f) return nullptr;
-  const auto cal = nlohmann::json::parse(f);
-  for (auto it = cal["scenes"].begin(); it != cal["scenes"].end(); ++it) {
-    if (it.key().find(match) == std::string::npos) continue;
-    const auto &e = it.value();
-    visualizer::CameraParams p;
-    for (int r = 0; r < 3; ++r) {
-      for (int c = 0; c < 3; ++c) {
-        p.k(r, c) = e["K_crop_resized"][r][c].get<double>();
-        p.r(r, c) = e["extrinsics_camera_to_ego"]["rotation_matrix"][r][c].get<double>();
-      }
-      p.t[r] = e["extrinsics_camera_to_ego"]["translation"][r].get<double>();
-    }
-    return visualizer::CreateCameraProjector(p);
-  }
-  return nullptr;
-}
+constexpr char kWindowName[] = "LatentDrive replay";
 
 double YawOf(const geometry_msgs::msg::Quaternion &q) {
   return std::atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z));
@@ -136,18 +101,24 @@ bool TriggerDue(double stamp_s, std::optional<double> last_tick_s, double gap_s,
   return stamp_s - *last_tick_s >= period_s - 0.5 * gap_s;
 }
 
+// @brief: center-crop the rows to a 2:1 band and resize to `width` x
+// `width / 2` (BGR): the display counterpart of the model's preprocessing,
+// so the overlay's intrinsics are the model crop's, scaled
+cv::Mat CropResize(const cv::Mat &frame, int width) {
+  cv::Mat img = frame;
+  const int band = img.cols / 2;
+  if (img.rows > band) img = img(cv::Rect(0, (img.rows - band) / 2, img.cols, band));
+  cv::Mat out;
+  cv::resize(img, out, cv::Size(width, width / 2), 0, 0, cv::INTER_LINEAR);
+  return out;
+}
+
 }  // namespace
 
 class LatentDriveNode : public rclcpp::Node {
  public:
   LatentDriveNode() : Node("latentdrive_node") {
     const auto engine = declare_parameter<std::string>("engine_file", "");
-    const auto calib = declare_parameter<std::string>("calibration_file", "");
-    const auto scene_match = declare_parameter<std::string>("scene_match", "prd_jt");
-    const auto smooth_alpha = declare_parameter<double>("smooth_alpha", 0.35);
-    viz_jpeg_quality_ = static_cast<int>(declare_parameter<int64_t>("viz_jpeg_quality", 80));
-    const auto viz_reliable = declare_parameter<bool>("viz_reliable", false);
-    viz_route_points_ = declare_parameter<bool>("viz_route_points", true);
     // View order of the camfront3 models: front, front_left, front_right. On
     // the prd_jt vehicles these are camera0 (57 deg), camera3 (+49.5 deg) and
     // camera4 (-49.6 deg); a single-view engine reads the first one only
@@ -161,32 +132,24 @@ class LatentDriveNode : public rclcpp::Node {
         "history_tolerance_s", model::planner::kDefaultHistoryToleranceS);
     const auto missing_view_fill = declare_parameter<std::string>("missing_view_fill", "skip");
     const auto max_rate_hz = declare_parameter<double>("max_rate_hz", 10.0);
-    const auto odom_topic = declare_parameter<std::string>(
-        "odom_topic", "/localization/kinematic_state");
-    const auto accel_topic = declare_parameter<std::string>(
-        "accel_topic", "/localization/acceleration");
-    route_source_ = declare_parameter<std::string>("route_source", "recorded");
-    const auto route = declare_parameter<std::string>("route_file", "");
-    const auto lanelet_map = declare_parameter<std::string>("lanelet_map", "");
-    const auto route_topic = declare_parameter<std::string>("route_topic", "/planning/mission_planning/route");
-    const auto recorded_topic = declare_parameter<std::string>(
-        "recorded_route_points_topic", "/tensorrt_e2e/debug/latentdrive/route_points");
-    const auto route_points_m =
-        declare_parameter<std::vector<double>>("route_points_m", std::vector<double>{});
-    const auto route_reversal_deg = declare_parameter<double>(
-        "route_reversal_deg", model::planner::kDefaultRouteReversalDeg);
+    const auto odom_topic = declare_parameter<std::string>("odom_topic", "/localization/kinematic_state");
+    const auto accel_topic = declare_parameter<std::string>("accel_topic", "/localization/acceleration");
+    route_points_topic_ = declare_parameter<std::string>(
+        "route_points_topic", "/tensorrt_e2e/debug/latentdrive/route_points");
     const auto motion_source = declare_parameter<std::string>("motion_source", "pose_difference");
+    const auto smooth_alpha = declare_parameter<double>("smooth_alpha", 0.35);
+    show_window_ = declare_parameter<bool>("show_window", true);
+    out_video_ = declare_parameter<std::string>("out_video", "");
+    viz_width_ = static_cast<int>(declare_parameter<int64_t>("viz_width", 1024));
 
     if (missing_view_fill != "skip" && missing_view_fill != "zeros") {
       throw std::runtime_error("missing_view_fill must be skip or zeros, got " + missing_view_fill);
-    }
-    if (route_source_ != "mission" && route_source_ != "recorded" && route_source_ != "file") {
-      throw std::runtime_error("route_source must be mission, recorded or file, got " + route_source_);
     }
     if (motion_source != "pose_difference" && motion_source != "twist") {
       throw std::runtime_error("motion_source must be pose_difference or twist, got " + motion_source);
     }
     period_s_ = max_rate_hz > 0.0 ? 1.0 / max_rate_hz : 0.0;
+    video_fps_ = max_rate_hz > 0.0 ? max_rate_hz : 10.0;
 
     planner_ = model::planner::CreatePlanner(engine);
     if (!planner_) throw std::runtime_error("failed to load the engine " + engine);
@@ -206,29 +169,17 @@ class LatentDriveNode : public rclcpp::Node {
 
     status::StatusBuilderParams status_params;
     status_params.num_route_points = planner_->NumRoutePoints();
-    status_params.route_points_m = route_points_m;
-    status_params.route_reversal_deg = route_reversal_deg;
     status_params.motion_source = motion_source == "twist" ? status::MotionSource::kTwist
                                                            : status::MotionSource::kPoseDifference;
     status_ = status::CreateStatusBuilder(status_params);
 
-    bev_ = visualizer::CreateBevVisualizer();
     // Display only: ~/plan carries the raw engine output, the overlay is what
     // gets filtered. Consecutive plans disagree by about a metre on how far
-    // they reach, which makes the BEV tail pulse in and out
+    // they reach, which makes the drawn tail pulse in and out
     smoother_ = visualizer::CreateTrajectorySmoother({smooth_alpha});
-    if (!window_ || !status_ || !bev_) {
-      throw std::runtime_error("failed to init the window / status builder / bev");
+    if (!window_ || !status_ || !smoother_) {
+      throw std::runtime_error("failed to init the window / status builder / smoother");
     }
-    if (!calib.empty()) {
-      projector_ = LoadProjector(calib, scene_match);
-      if (!projector_) {
-        RCLCPP_WARN(get_logger(), "no calibration entry matching '%s' in %s", scene_match.c_str(),
-                    calib.c_str());
-      }
-    }
-    if (route_source_ == "file") LoadRoute(route);
-    if (route_source_ == "mission") LoadLaneletMap(lanelet_map);
 
     // warmup so the first real inference is not slow
     const std::vector<float> zeros(planner_->VideoNumel(), 0.f);
@@ -271,50 +222,28 @@ class LatentDriveNode : public rclcpp::Node {
           std::lock_guard<std::mutex> lock(plan_mutex_);
           accel_ = m;
         });
-    if (route_source_ == "mission") {
-      // Latched by mission planning (and by the replay launch for a bag
-      // started past it): a subscriber that comes late still gets it
-      sub_route_ = create_subscription<autoware_planning_msgs::msg::LaneletRoute>(
-          route_topic, rclcpp::QoS(1).reliable().transient_local(),
-          [this](autoware_planning_msgs::msg::LaneletRoute::ConstSharedPtr m) { OnLaneletRoute(*m); });
-    }
-    if (route_source_ == "recorded") {
-      sub_recorded_ = create_subscription<geometry_msgs::msg::PoseArray>(
-          recorded_topic, rclcpp::QoS(10),
-          [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) { OnRecordedRoutePoints(m); });
-    }
+    sub_route_points_ = create_subscription<geometry_msgs::msg::PoseArray>(
+        route_points_topic_, rclcpp::QoS(10),
+        [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) { OnRoutePoints(m); });
 
-    // Without a calibration file the overlay comes from the bag itself: the
-    // view-0 camera_info (intrinsics) and /tf_static (base_link -> camera)
-    if (!projector_) {
-      tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
-      tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-      std::string info_topic = camera_topics_[0];
-      for (const std::string suffix : {"/image_raw/compressed", "/image_rect_color/compressed"}) {
-        const auto pos = info_topic.rfind(suffix);
-        if (pos != std::string::npos && pos + suffix.size() == info_topic.size()) {
-          info_topic = info_topic.substr(0, pos) + "/camera_info";
-        }
+    // The overlay comes from the bag itself: the view-0 camera_info
+    // (intrinsics) and /tf_static (base_link -> camera)
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    std::string info_topic = camera_topics_[0];
+    for (const std::string suffix : {"/image_raw/compressed", "/image_rect_color/compressed"}) {
+      const auto pos = info_topic.rfind(suffix);
+      if (pos != std::string::npos && pos + suffix.size() == info_topic.size()) {
+        info_topic = info_topic.substr(0, pos) + "/camera_info";
       }
-      sub_info_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-          info_topic, sensor_qos, [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
-            std::lock_guard<std::mutex> lock(viz_mutex_);
-            camera_info_ = m;
-          });
     }
+    sub_info_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+        info_topic, sensor_qos, [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr m) {
+          std::lock_guard<std::mutex> lock(viz_mutex_);
+          camera_info_ = m;
+        });
 
-    // Sensor QoS on the viz topics: best-effort, keep-last. A live overlay must
-    // never apply back-pressure -- with the default reliable, depth-1 profile a
-    // viewer that falls behind blocks the publisher, and the stall reaches the
-    // image callback as dropped camera frames (measured: 5.7 Hz with a viewer
-    // attached and four "stamp jumped" resets over a 60 s bag)
-    const rclcpp::QoS viz_qos = viz_reliable ? rclcpp::QoS(1).reliable() : sensor_qos;
-    pub_viz_ = create_publisher<sensor_msgs::msg::Image>("~/viz", viz_qos);
-    pub_viz_jpeg_ =
-        create_publisher<sensor_msgs::msg::CompressedImage>("~/viz/compressed", viz_qos);
     pub_plan_ = create_publisher<nav_msgs::msg::Path>("~/plan", 1);
-    pub_plan_map_ = create_publisher<nav_msgs::msg::Path>("~/plan_map", 1);
-    pub_route_points_ = create_publisher<geometry_msgs::msg::PoseArray>("~/route_points", 1);
 
     // Named, so `top -H` tells the cameras, the planner and the drawing apart
     viz_thread_ = std::thread(&LatentDriveNode::VizLoop, this);
@@ -329,18 +258,16 @@ class LatentDriveNode : public rclcpp::Node {
 
     std::string views;
     for (const auto &t : camera_topics_) views += (views.empty() ? "" : ", ") + t;
-    const std::string route_from = route_source_ == "mission"    ? route_topic + " + " + lanelet_map
-                                   : route_source_ == "recorded" ? recorded_topic
-                                                                 : route;
     RCLCPP_INFO(get_logger(),
                 "latentdrive_node ready: %d view%s [%s] (side views within %.0f ms, missing -> %s), "
                 "status [1, %d] = %d route point%s from %s, motion from %s, %d waypoints, "
-                "at most %.1f Hz on the view-0 stamps",
+                "at most %.1f Hz on the view-0 stamps; overlay %s%s%s",
                 num_views_, num_views_ == 1 ? "" : "s", views.c_str(), view_tolerance_s_ * 1e3,
                 missing_view_fill.c_str(), planner_->StatusDim(), planner_->NumRoutePoints(),
-                planner_->NumRoutePoints() == 1 ? "" : "s",
-                route_from.c_str(),
-                motion_source.c_str(), planner_->NumWaypoints(), max_rate_hz);
+                planner_->NumRoutePoints() == 1 ? "" : "s", route_points_topic_.c_str(),
+                motion_source.c_str(), planner_->NumWaypoints(), max_rate_hz,
+                show_window_ ? "in a window" : "", show_window_ && !out_video_.empty() ? " and " : "",
+                out_video_.empty() ? (show_window_ ? "" : "off") : ("-> " + out_video_).c_str());
   }
 
   ~LatentDriveNode() override {
@@ -371,7 +298,6 @@ class LatentDriveNode : public rclcpp::Node {
     cv::Mat frame;
     status::StatusResult status;
     status::PoseSample ego;
-    double ego_z = 0.0;
   };
 
   // A staged plan: its assembled [V, 3, 4, H, W] window and how many of its
@@ -389,83 +315,6 @@ class LatentDriveNode : public rclcpp::Node {
     common::EgoStatus ego;
     std::size_t filled = 0;
   };
-
-  // @brief: route.npy is [N, 2] or [N, 3] (map x, y[, yaw]) in driving order
-  void LoadRoute(const std::string &path) {
-    if (path.empty()) throw std::runtime_error("route_source:=file needs route_file");
-    const auto a = utils::LoadNpy(path);
-    if (a.shape.size() != 2 || (a.shape[1] != 2 && a.shape[1] != 3) || a.shape[0] < 2) {
-      throw std::runtime_error(path + " is not an [N, 2|3] route");
-    }
-    std::vector<status::Point2d> route(a.shape[0]);
-    for (std::size_t i = 0; i < a.shape[0]; ++i) {
-      route[i] = {a.data[i * a.shape[1] + 0], a.data[i * a.shape[1] + 1]};
-    }
-    status_->SetRoute(route);
-    RCLCPP_INFO(get_logger(), "loaded route: %zu points from %s", route.size(), path.c_str());
-  }
-
-  // @brief: the lanelet centerlines of scripts/convert_map.py,
-  // {"lanelets": {"<id>": [[x, y], ...]}} in the map frame
-  void LoadLaneletMap(const std::string &path) {
-    if (path.empty()) {
-      throw std::runtime_error("route_source:=mission needs lanelet_map (scripts/convert_map.py <lanelet2_map.osm> map.json)");
-    }
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("cannot open lanelet_map " + path);
-    const auto map = nlohmann::json::parse(f);
-    for (const auto &[id, line] : map.at("lanelets").items()) {
-      auto &points = centerlines_[std::stoll(id)];
-      for (const auto &p : line) points.push_back({p[0].get<double>(), p[1].get<double>()});
-    }
-    RCLCPP_INFO(get_logger(), "lanelet map: %zu lanelet centerlines from %s", centerlines_.size(), path.c_str());
-  }
-
-  // @brief: the route as the vehicle's planner builds it -- the centerlines
-  // of the preferred lanelets in route order (repeated joints dropped), cut
-  // at the point nearest the goal. A new route (a reroute) replaces the old
-  void OnLaneletRoute(const autoware_planning_msgs::msg::LaneletRoute &m) {
-    std::vector<status::Point2d> polyline;
-    std::vector<int64_t> missing;
-    for (const auto &segment : m.segments) {
-      const auto it = centerlines_.find(segment.preferred_primitive.id);
-      if (it == centerlines_.end()) {
-        missing.push_back(segment.preferred_primitive.id);
-        continue;
-      }
-      for (const auto &p : it->second) {
-        if (polyline.empty() || std::hypot(p.x - polyline.back().x, p.y - polyline.back().y) > 1e-3) {
-          polyline.push_back(p);
-        }
-      }
-    }
-    if (polyline.size() < 2) {
-      RCLCPP_ERROR(get_logger(), "route of %zu lanelets: none of them is in the lanelet map -- the route was "
-                   "planned on another map", m.segments.size());
-      return;
-    }
-    const double gx = m.goal_pose.position.x, gy = m.goal_pose.position.y;
-    std::size_t nearest = 0;
-    for (std::size_t i = 1; i < polyline.size(); ++i) {
-      if (std::hypot(polyline[i].x - gx, polyline[i].y - gy) <
-          std::hypot(polyline[nearest].x - gx, polyline[nearest].y - gy)) {
-        nearest = i;
-      }
-    }
-    polyline.resize(nearest + 1);
-    {
-      std::lock_guard<std::mutex> lock(plan_mutex_);
-      status_->SetRoute(polyline);
-    }
-    RCLCPP_INFO(get_logger(), "route: %zu lanelets -> %zu centerline points", m.segments.size(), polyline.size());
-    if (!missing.empty()) {
-      RCLCPP_ERROR(get_logger(),
-                   "%zu of the route's %zu lanelets are not in the lanelet map (first: %ld): the route was "
-                   "planned on another map revision. Those stretches are bridged with straight lines and "
-                   "the route points there are unreliable -- convert the map the vehicle drove with",
-                   missing.size(), m.segments.size(), static_cast<long>(missing.front()));
-    }
-  }
 
   void OnOdometry(nav_msgs::msg::Odometry::ConstSharedPtr m) {
     std::lock_guard<std::mutex> lock(plan_mutex_);
@@ -509,48 +358,35 @@ class LatentDriveNode : public rclcpp::Node {
     return s;
   }
 
-  void OnRecordedRoutePoints(geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
+  void OnRoutePoints(geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
     std::lock_guard<std::mutex> lock(plan_mutex_);
     const double stamp_s = rclcpp::Time(m->header.stamp).seconds();
-    if (!recorded_.empty() && stamp_s < recorded_.back().first - 1.0) recorded_.clear();
+    if (!route_points_.empty() && stamp_s < route_points_.back().first - 1.0) route_points_.clear();
     std::vector<status::Point2d> points;
     for (const auto &p : m->poses) points.push_back({p.position.x, p.position.y});
-    recorded_.emplace_back(stamp_s, std::move(points));
-    while (recorded_.size() > 50) recorded_.pop_front();
+    route_points_.emplace_back(stamp_s, std::move(points));
+    while (route_points_.size() > 50) route_points_.pop_front();
   }
 
   // @brief: the recorded route points nearest in time to `stamp_s`. The
   // vehicle stamped them with its tick, a few ms after the camera frame it
-  // planned on; more than kRecordedMaxGapS away and they belong to another tick
-  std::optional<std::vector<status::Point2d>> RecordedAt(double stamp_s) const {
+  // planned on; more than kRoutePointsMaxGapS away and they belong to another tick
+  std::optional<std::vector<status::Point2d>> RoutePointsAt(double stamp_s) const {
     const std::pair<double, std::vector<status::Point2d>> *best = nullptr;
-    for (const auto &r : recorded_) {
+    for (const auto &r : route_points_) {
       if (!best || std::abs(r.first - stamp_s) < std::abs(best->first - stamp_s)) best = &r;
     }
-    if (!best || std::abs(best->first - stamp_s) > kRecordedMaxGapS) return std::nullopt;
+    if (!best || std::abs(best->first - stamp_s) > kRoutePointsMaxGapS) return std::nullopt;
     return best->second;
-  }
-
-  // @brief: center-crop the height to width/2 and resize to 512x256 (BGR),
-  // the display counterpart of the window's preprocessing, for the overlay
-  static cv::Mat CropResize(const cv::Mat &frame) {
-    cv::Mat img = frame;
-    const int target_h = img.cols / 2;
-    if (img.rows > target_h) img = img(cv::Rect(0, (img.rows - target_h) / 2, img.cols, target_h));
-    cv::Mat out;
-    cv::resize(img, out, cv::Size(model::planner::kInputWidth, model::planner::kInputHeight),
-               0, 0, cv::INTER_LINEAR);
-    return out;
   }
 
   // @brief: every camera. The JPEG decode and the preprocessing run here, on
   // the camera's own thread and outside the lock; the lock is held only to
-  // push the frame and
-  // to stage a plan, never across an inference. A view-0 frame first settles
-  // the plan still waiting for its side views (a newer front frame
-  // supersedes it), then joins the window and -- if the pacing says so --
-  // becomes the pending plan; a side frame joins the window and may complete
-  // the pending plan
+  // push the frame and to stage a plan, never across an inference. A view-0
+  // frame first settles the plan still waiting for its side views (a newer
+  // front frame supersedes it), then joins the window and -- if the pacing
+  // says so -- becomes the pending plan; a side frame joins the window and
+  // may complete the pending plan
   void OnImage(int view, sensor_msgs::msg::CompressedImage::ConstSharedPtr msg) {
     const cv::Mat frame = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
     if (frame.empty()) return;
@@ -579,10 +415,9 @@ class LatentDriveNode : public rclcpp::Node {
       return;
     }
     // The ego is sampled at the front frame's stamp, so a plan that waits
-    // for its side views (or the recorded route points) still describes
-    // this instant
+    // for its side views (or the route points) still describes this instant
     const auto odom = OdomAt(stamp_s);
-    pending_ = Pending{stamp_s, msg->header.stamp, frame, {}, ToSample(*odom), odom->pose.pose.position.z};
+    pending_ = Pending{stamp_s, msg->header.stamp, frame, {}, ToSample(*odom)};
     Stage(false);
   }
 
@@ -591,10 +426,10 @@ class LatentDriveNode : public rclcpp::Node {
   // frame within tolerance waits while it may still arrive (the newest slot,
   // while that camera has not passed the front stamp + tolerance yet); after
   // that, or when `final` (a newer front frame came), it skips the plan or,
-  // with missing_view_fill:=zeros, takes the blank frame there. In recorded
-  // mode the plan also waits for the vehicle's route points of this tick,
-  // which it published a few tens of ms after the frame. A plan that is
-  // ready is assembled into a staging buffer and handed to the planning thread
+  // with missing_view_fill:=zeros, takes the blank frame there. The plan also
+  // waits for the vehicle's route points of this tick, which it published a
+  // few tens of ms after the frame. A plan that is ready is assembled into a
+  // staging buffer and handed to the planning thread
   void Stage(bool final) {
     if (!pending_) return;
     const preprocess::ViewSelection sel = window_->Select();
@@ -618,26 +453,17 @@ class LatentDriveNode : public rclcpp::Node {
     }
 
     // --- status ---
-    status::StatusResult st;
-    if (route_source_ == "recorded") {
-      const bool have_this_tick = !recorded_.empty() && recorded_.back().first >= pending_->stamp_s - 0.02;
-      if (!have_this_tick && !final) return;
-      const auto points = RecordedAt(pending_->stamp_s);
-      if (!points) {
-        Skip("no recorded route points within " + std::to_string(static_cast<int>(kRecordedMaxGapS * 1e3)) +
-             " ms of the frame -- is the bag playing the vehicle planner's route_points topic? "
-             "(route_source:=file takes a route.npy instead)");
-        return;
-      }
-      st = status_->BuildWithRoutePoints(pending_->stamp_s, pending_->ego, *points);
-    } else {
-      st = status_->Build(pending_->stamp_s, pending_->ego);
+    const bool have_this_tick = !route_points_.empty() && route_points_.back().first >= pending_->stamp_s - 0.02;
+    if (!have_this_tick && !final) return;
+    const auto points = RoutePointsAt(pending_->stamp_s);
+    if (!points) {
+      Skip("no route points within " + std::to_string(static_cast<int>(kRoutePointsMaxGapS * 1e3)) +
+           " ms of the frame -- is the bag playing " + route_points_topic_ + "?");
+      return;
     }
+    status::StatusResult st = status_->BuildWithRoutePoints(pending_->stamp_s, pending_->ego, *points);
     if (!st.ok) {
-      Skip("no status: " + st.error +
-           (route_source_ == "mission" && !status_->HasRoute()
-                ? " (no usable LaneletRoute yet -- is the route topic in the bag?)"
-                : ""));
+      Skip("no status: " + st.error);
       return;
     }
 
@@ -693,10 +519,10 @@ class LatentDriveNode : public rclcpp::Node {
       const common::Trajectory &shown = Smoothed(plan, job.pending.stamp);
       PublishPlan(plan, job.pending);
 
-      // Drawing and encoding cost more than the inference does; the viz thread
-      // does them. The mailbox holds one job: if drawing falls behind, the
-      // pending frame is replaced rather than queued, so the overlay stays live
-      // and the planning loop never waits. `frame` is a cv::Mat, so this shares
+      // Drawing costs more than the inference does; the viz thread does it.
+      // The mailbox holds one job: if drawing falls behind, the pending frame
+      // is replaced rather than queued, so the overlay stays live and the
+      // planning loop never waits. `frame` is a cv::Mat, so this shares
       // rather than copies
       {
         std::lock_guard<std::mutex> lock(viz_mutex_);
@@ -743,16 +569,12 @@ class LatentDriveNode : public rclcpp::Node {
     return shown_;
   }
 
-  // @brief: ~/plan in base_link (the raw engine output), ~/plan_map and
-  // ~/route_points in the map frame through the ego pose the plan is anchored
-  // on, so RViz can draw them without a TF tree
+  // @brief: ~/plan in base_link: the raw engine output, stamped with the
+  // frame it was planned on
   void PublishPlan(const common::Trajectory &plan, const Pending &job) {
-    nav_msgs::msg::Path path, path_map;
+    nav_msgs::msg::Path path;
     path.header.stamp = job.stamp;
     path.header.frame_id = "base_link";
-    path_map.header.stamp = job.stamp;
-    path_map.header.frame_id = "map";
-    const double c = std::cos(job.ego.yaw), s = std::sin(job.ego.yaw);
     for (const auto &wp : plan) {
       geometry_msgs::msg::PoseStamped ps;
       ps.header = path.header;
@@ -761,36 +583,14 @@ class LatentDriveNode : public rclcpp::Node {
       ps.pose.orientation.z = std::sin(wp.heading / 2);
       ps.pose.orientation.w = std::cos(wp.heading / 2);
       path.poses.push_back(ps);
-
-      geometry_msgs::msg::PoseStamped pm;
-      pm.header = path_map.header;
-      pm.pose.position.x = job.ego.x + c * wp.x - s * wp.y;
-      pm.pose.position.y = job.ego.y + s * wp.x + c * wp.y;
-      pm.pose.position.z = job.ego_z;
-      pm.pose.orientation.z = std::sin((job.ego.yaw + wp.heading) / 2);
-      pm.pose.orientation.w = std::cos((job.ego.yaw + wp.heading) / 2);
-      path_map.poses.push_back(pm);
     }
     pub_plan_->publish(path);
-    pub_plan_map_->publish(path_map);
-
-    geometry_msgs::msg::PoseArray points;
-    points.header = path_map.header;
-    for (const auto &p : job.status.route_points_map) {
-      geometry_msgs::msg::Pose pose;
-      pose.position.x = p.x;
-      pose.position.y = p.y;
-      pose.position.z = job.ego_z;
-      pose.orientation.w = 1.0;
-      points.poses.push_back(pose);
-    }
-    pub_route_points_->publish(points);
   }
 
   // @brief: the overlay projector from the view-0 camera_info and /tf_static,
   // built once both are there. Called from the viz thread
   void EnsureProjector() {
-    if (projector_ || !tf_buffer_) return;
+    if (projector_) return;
     sensor_msgs::msg::CameraInfo::ConstSharedPtr info;
     {
       std::lock_guard<std::mutex> lock(viz_mutex_);
@@ -806,9 +606,9 @@ class LatentDriveNode : public rclcpp::Node {
                            info->header.frame_id.c_str(), e.what());
       return;
     }
-    // K for the 512x256 crop: rows cropped to a centred width/2 band, then
-    // the whole image scaled by 512 / width
-    const double scale = static_cast<double>(model::planner::kInputWidth) / info->width;
+    // K for the drawn image: rows cropped to a centred width/2 band, then the
+    // whole image scaled to viz_width
+    const double scale = static_cast<double>(viz_width_) / info->width;
     const double top = std::max(0.0, (info->height - info->width / 2.0) / 2.0);
     visualizer::CameraParams p;
     p.k = cv::Matx33d(info->k[0] * scale, info->k[1] * scale, info->k[2] * scale,
@@ -825,82 +625,72 @@ class LatentDriveNode : public rclcpp::Node {
   }
 
   // @brief: the viz thread. Sleeps until the inference leaves a job, draws
-  // it, and goes back to sleep. `bev_` and `projector_` are used by this
-  // thread alone
+  // it, and goes back to sleep; between jobs it keeps the window's event loop
+  // alive. HighGUI is used by this thread alone
   void VizLoop() {
     while (true) {
-      VizJob job;
+      std::optional<VizJob> job;
       {
         std::unique_lock<std::mutex> lock(viz_mutex_);
-        viz_cv_.wait(lock, [this] { return viz_stop_ || viz_job_.has_value(); });
-        if (viz_stop_) return;
-        job = std::move(*viz_job_);
-        viz_job_.reset();
+        viz_cv_.wait_for(lock, 100ms, [this] { return viz_stop_ || viz_job_.has_value(); });
+        if (viz_stop_) break;
+        job.swap(viz_job_);
       }
-      EnsureProjector();
-      PublishViz(CropResize(job.frame), job);
+      if (job) {
+        EnsureProjector();
+        Draw(*job);
+      } else if (window_open_) {
+        PollWindow();
+      }
+    }
+    if (writer_.isOpened()) {
+      writer_.release();
+      RCLCPP_INFO(get_logger(), "wrote %s", out_video_.c_str());
+    }
+    if (window_open_) cv::destroyAllWindows();
+  }
+
+  void Draw(const VizJob &job) {
+    cv::Mat image = CropResize(job.frame, viz_width_);
+    if (projector_) projector_->DrawRibbon(image, job.plan, 0.9, 0.5);
+    const float speed = std::hypot(job.ego.vel_x, job.ego.vel_y);
+    const float reach = std::hypot(job.plan.back().x, job.plan.back().y);
+    // km/h on the overlay, as a driver would read it; the log line stays in
+    // m/s, the unit the model and the odometry work in
+    cv::putText(image,
+                cv::format("LatentDrive TRT %dv  v %.1f km/h  |4s| %.1f m%s", num_views_, speed * 3.6f, reach,
+                           job.filled ? "  (blank side view)" : ""),
+                {12, 28}, cv::FONT_HERSHEY_DUPLEX, 0.7, {230, 230, 230}, 1, cv::LINE_AA);
+
+    if (!out_video_.empty() && !writer_failed_) {
+      if (!writer_.isOpened()) {
+        writer_.open(out_video_, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), video_fps_, image.size());
+        if (!writer_.isOpened()) {
+          RCLCPP_ERROR(get_logger(), "cannot open %s for writing", out_video_.c_str());
+          writer_failed_ = true;
+        }
+      }
+      if (writer_.isOpened()) writer_.write(image);
+    }
+    if (show_window_) {
+      try {
+        cv::imshow(kWindowName, image);
+        window_open_ = true;
+        PollWindow();
+      } catch (const cv::Exception &e) {
+        RCLCPP_WARN(get_logger(), "no window (%s): drawing continues without one; show_window:=false "
+                    "silences this", e.what());
+        show_window_ = false;
+      }
     }
   }
 
-  void PublishViz(cv::Mat camera, const VizJob &job) {
-    const common::Trajectory &plan = job.plan;
-    const common::EgoStatus &ego = job.ego;
-    if (projector_) projector_->DrawRibbon(camera, plan, 0.9, 0.5);
-
-    bev_->Clear();
-    bev_->DrawTrajectoryHorizon(plan, 2);
-    if (viz_route_points_) {
-      for (const common::RoutePoint &p : ego.route_points) bev_->DrawSubgoal(p.x_m, p.y_m);
-    }
-    bev_->DrawVelocity(ego.vel_x, ego.vel_y);
-    bev_->AddLegend("plan now->+4s", visualizer::HorizonColor(0.0));
-    if (viz_route_points_) {
-      bev_->AddLegend(ego.route_points.size() == 1 ? "subgoal 50m" : "route points",
-                      visualizer::color::kSubgoal);
-    }
-
-    const int H = 560;
-    cv::Mat cam_panel, bev_panel;
-    cv::resize(camera, cam_panel, cv::Size(H * camera.cols / camera.rows, H));
-    const cv::Mat &bev = bev_->Image();
-    cv::resize(bev, bev_panel, cv::Size(H * bev.cols / bev.rows, H), 0, 0, cv::INTER_AREA);
-
-    const float speed = std::hypot(ego.vel_x, ego.vel_y);
-    const float wp = std::hypot(plan.back().x, plan.back().y);
-    // km/h on the overlay, to match the offline visualizer; the log line stays
-    // in m/s, which is the unit the model and the odometry work in
-    cv::putText(cam_panel,
-                cv::format("LatentDrive TRT %dv  v %.1f km/h  |4s| %.1f m%s", num_views_, speed * 3.6f, wp,
-                           job.filled ? "  (blank side view)" : ""),
-                {12, 28}, cv::FONT_HERSHEY_DUPLEX, 0.6, {230, 230, 230}, 1, cv::LINE_AA);
-
-    cv::Mat frame(H, cam_panel.cols + 2 + bev_panel.cols, CV_8UC3, cv::Scalar(45, 47, 47));
-    cam_panel.copyTo(frame(cv::Rect(0, 0, cam_panel.cols, H)));
-    bev_panel.copyTo(frame(cv::Rect(cam_panel.cols + 2, 0, bev_panel.cols, H)));
-
-    std_msgs::msg::Header header;
-    header.stamp = now();
-    header.frame_id = "base_link";
-
-    // JPEG by default: the raw panel is 2.4 MB, which DDS delivers at about
-    // 4 Hz on this machine, and the encoded one is nearer 150 kB
-    sensor_msgs::msg::CompressedImage jpeg;
-    jpeg.header = header;
-    jpeg.format = "jpeg";
-    cv::imencode(".jpg", frame, jpeg.data, {cv::IMWRITE_JPEG_QUALITY, viz_jpeg_quality_});
-    pub_viz_jpeg_->publish(jpeg);
-
-    // The raw topic is kept for anything that cannot read the compressed one,
-    // but only paid for while something is actually subscribed to it
-    if (pub_viz_->get_subscription_count() > 0) {
-      sensor_msgs::msg::Image out;
-      out.header = header;
-      out.height = frame.rows;
-      out.width = frame.cols;
-      out.encoding = "bgr8";
-      out.step = frame.cols * 3;
-      out.data.assign(frame.data, frame.data + frame.total() * 3);
-      pub_viz_->publish(out);
+  // @brief: pump the window's events; Esc or q ends the node
+  void PollWindow() {
+    const int key = cv::waitKey(1);
+    if (key == 27 || key == 'q') {
+      RCLCPP_INFO(get_logger(), "window closed by key -- shutting down");
+      rclcpp::shutdown();
     }
   }
 
@@ -910,7 +700,7 @@ class LatentDriveNode : public rclcpp::Node {
   int num_views_ = 1;
   std::vector<std::string> camera_topics_;
   double view_tolerance_s_ = model::planner::kDefaultViewToleranceS;
-  std::string route_source_;
+  std::string route_points_topic_;
 
   // Camera-trigger pacing on the view-0 header stamps
   double period_s_ = 0.1;
@@ -921,7 +711,7 @@ class LatentDriveNode : public rclcpp::Node {
   std::optional<Pending> pending_;
   std::optional<ReadyJob> ready_;
   std::vector<float> spare_video_;
-  // window_, pending_, ready_, spare_video_, status_, odom_, odom_history_, accel_, recorded_, the tallies
+  // window_, pending_, ready_, spare_video_, status_, odom_, odom_history_, accel_, route_points_, the tallies
   std::mutex plan_mutex_;
   std::condition_variable plan_cv_;
   std::thread plan_thread_;
@@ -931,12 +721,9 @@ class LatentDriveNode : public rclcpp::Node {
   std::size_t dropped_ = 0;
   std::size_t filled_ = 0;
   double worst_view_offset_s_ = 0.0;
-  std::deque<std::pair<double, std::vector<status::Point2d>>> recorded_;
-  // route_source:=mission: lanelet id -> centerline (map frame), read-only after startup
-  std::unordered_map<int64_t, std::vector<status::Point2d>> centerlines_;
-  static constexpr double kRecordedMaxGapS = 0.3;
+  std::deque<std::pair<double, std::vector<status::Point2d>>> route_points_;
+  static constexpr double kRoutePointsMaxGapS = 0.3;
 
-  std::shared_ptr<visualizer::BevVisualizer> bev_;
   std::shared_ptr<visualizer::CameraProjector> projector_;
   std::shared_ptr<visualizer::TrajectorySmoother> smoother_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -962,22 +749,24 @@ class LatentDriveNode : public rclcpp::Node {
   std::vector<rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr> sub_images_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<geometry_msgs::msg::AccelWithCovarianceStamped>::SharedPtr sub_accel_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_recorded_;
-  rclcpp::Subscription<autoware_planning_msgs::msg::LaneletRoute>::SharedPtr sub_route_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_route_points_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr sub_info_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_plan_;
+
+  // The drawing: viz_job_, viz_stop_ and camera_info_ behind viz_mutex_; the
+  // window, the writer and the projector belong to the viz thread
   std::optional<VizJob> viz_job_;
-  std::mutex viz_mutex_;  // viz_job_, viz_stop_, camera_info_
+  std::mutex viz_mutex_;
   std::condition_variable viz_cv_;
   std::thread viz_thread_;
   bool viz_stop_ = false;
-  int viz_jpeg_quality_ = 80;
-  bool viz_route_points_ = true;  // draw the route points in the BEV
-
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_viz_;
-  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_viz_jpeg_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_plan_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_plan_map_;
-  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_route_points_;
+  bool show_window_ = true;
+  bool window_open_ = false;
+  std::string out_video_;
+  double video_fps_ = 10.0;
+  cv::VideoWriter writer_;
+  bool writer_failed_ = false;
+  int viz_width_ = 1024;
 };
 
 int main(int argc, char **argv) {

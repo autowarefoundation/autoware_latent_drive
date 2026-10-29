@@ -1,28 +1,18 @@
-"""Open-loop replay: start the planner node, play the rosbag, show the result.
+"""Open-loop replay: start the planner node, latch the bag's /tf_static, play the bag.
 
     ros2 launch latentdrive_ros replay.launch.py \
-        bag:=/path/to/bag_dir engine:=/path/to.engine
+        bag:=/path/to/bag_dir engine:=/path/to.engine [out_video:=/path/to.mp4]
 
 The engine decides how many cameras are read (the first 1, 2 or 3 of
 camera0/camera1/camera2, default CAM_FRONT, FRONT_LEFT, FRONT_RIGHT of the
 prd_jt vehicles = camera0, camera3, camera4) and whether the status carries one
-subgoal or six route points. Where the route comes from (route_source):
+subgoal or six route points. The route points are the ones the vehicle's
+planner fed its model, recorded in the bag on
+/tensorrt_e2e/debug/latentdrive/route_points (LatentDrive runs).
 
-- mission (the default when lanelet_map:= is given): the bag's mission-planning
-  route (LaneletRoute) on the lanelet centerlines of lanelet_map:=map.json,
-  which scripts/convert_map.py writes from the map's lanelet2_map.osm. Works
-  with any Autoware bag that recorded the route;
-- recorded (the default otherwise): the route points the vehicle's planner fed
-  the model, recorded in the bags of LatentDrive runs;
-- file: built from route:=route.npy.
-
-The node publishes /latentdrive_node/viz (camera + BEV image, also as
-/viz/compressed), /latentdrive_node/plan (base_link) and, in the map frame,
-/latentdrive_node/plan_map and /latentdrive_node/route_points. With
-lanelet_map:= the map is drawn too (publish_map.py: road, lane lines, the
-route's lanes, the ego car). viewer:=rviz (default) opens RViz on all of them
-next to the plan the vehicle recorded, following the car from behind;
-viewer:=rqt opens rqt_image_view on the image only; viewer:=none is headless.
+The node publishes /latentdrive_node/plan (base_link) and shows the plan
+projected on the front camera in an OpenCV window (Esc or q closes it;
+show_window:=false for a headless run); out_video:= also writes it to an mp4.
 """
 import os
 
@@ -30,30 +20,19 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, SetEnvironmentVariable,
                             TimerAction)
-from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-RECORDED_ROUTE_POINTS = "/tensorrt_e2e/debug/latentdrive/route_points"
-RECORDED_PLAN = "/tensorrt_e2e/debug/latentdrive/plan"
-ROUTE = "/planning/mission_planning/route"
-
-
-def route_source(context):
-    source = LaunchConfiguration("route_source").perform(context)
-    if source == "auto":
-        return "mission" if LaunchConfiguration("lanelet_map").perform(context) else "recorded"
-    return source
+ROUTE_POINTS = "/tensorrt_e2e/debug/latentdrive/route_points"
 
 
 def bag_nodes(context):
-    """The planner node and the latched-topic publisher, with their parameters
+    """The planner node and the /tf_static publisher, with their parameters
     resolved here: a list of substitutions would reach the node as one
     concatenated string, and a float given as 10 as an integer -- both are
     refused by the declared parameter types"""
     value = lambda name: LaunchConfiguration(name).perform(context)  # noqa: E731
     cameras = [value(f"camera{i}") for i in range(3)]
-    source = route_source(context)
     planner = Node(
         package="latentdrive_ros",
         executable="latentdrive_node",
@@ -62,39 +41,24 @@ def bag_nodes(context):
         parameters=[{
             "use_sim_time": True,
             "engine_file": value("engine"),
-            "calibration_file": value("calibration"),
-            "scene_match": value("scene_match"),
-            "route_source": source,
-            "route_file": value("route"),
-            "lanelet_map": value("lanelet_map"),
-            "route_topic": ROUTE,
-            "motion_source": value("motion_source"),
             "camera_topics": [c for c in cameras if c],
             "view_tolerance_s": float(value("view_tolerance_s")),
             "missing_view_fill": value("missing_view_fill"),
             "max_rate_hz": float(value("max_rate_hz")),
-            "recorded_route_points_topic": RECORDED_ROUTE_POINTS,
-            "viz_route_points": value("show_route_points") == "true",
+            "motion_source": value("motion_source"),
+            "route_points_topic": ROUTE_POINTS,
+            "show_window": value("show_window") == "true",
+            "out_video": value("out_video"),
         }],
     )
-    # /tf_static and the route are recorded once, when they are set, so a bag
-    # started at start_offset never plays them; this publishes them, latched,
-    # from the bag itself
-    latched = Node(
-        package="latentdrive_ros", executable="publish_latched.py", name="latched_from_bag",
-        arguments=[value("bag"), "--start-offset", value("start_offset"),
-                   "--route-topic", ROUTE if source == "mission" else ""],
+    # /tf_static is recorded once, at the bag start, so a bag started at
+    # start_offset never plays it; this publishes it, latched, from the bag
+    tf_static = Node(
+        package="latentdrive_ros", executable="publish_tf_static.py", name="tf_static_from_bag",
+        arguments=[value("bag"), "--start-offset", value("start_offset")],
         output="log",
     )
-    nodes = [planner, latched]
-    # The map under the plan: road, lane lines, the route's lanes, the ego car
-    if value("lanelet_map"):
-        nodes.append(Node(
-            package="latentdrive_ros", executable="publish_map.py", name="map_viz",
-            arguments=[value("lanelet_map"), "--route-topic", ROUTE], output="log",
-            parameters=[{"use_sim_time": True}],
-        ))
-    return nodes
+    return [planner, tf_static]
 
 
 def generate_launch_description():
@@ -114,23 +78,8 @@ def generate_launch_description():
     return LaunchDescription(fastdds + [
         DeclareLaunchArgument("bag", description="rosbag directory to replay (with metadata.yaml)"),
         DeclareLaunchArgument("engine", description="TensorRT engine file"),
-        DeclareLaunchArgument("calibration", default_value="",
-                              description="calibration.json for the overlay; empty = from the bag's "
-                                          "camera_info and /tf_static"),
-        DeclareLaunchArgument("scene_match", default_value="prd_jt",
-                              description="calibration.json scene entry to use"),
-        DeclareLaunchArgument("route_source", default_value="auto",
-                              description="mission (the bag's LaneletRoute + lanelet_map) | recorded (the "
-                                          "vehicle's route points in the bag) | file | auto: mission when "
-                                          "lanelet_map is given, else recorded"),
-        DeclareLaunchArgument("lanelet_map", default_value="",
-                              description="lanelet centerlines for route_source:=mission "
-                                          "(scripts/convert_map.py <lanelet2_map.osm> map.json)"),
-        DeclareLaunchArgument("route", default_value="", description="route.npy for route_source:=file"),
-        DeclareLaunchArgument("motion_source", default_value="pose_difference",
-                              description="pose_difference (training convention) | twist"),
         DeclareLaunchArgument("camera0", default_value="/sensing/camera/camera0/image_raw/compressed",
-                              description="view 0: CAM_FRONT (anchors the history)"),
+                              description="view 0: CAM_FRONT (anchors the history, drawn on)"),
         DeclareLaunchArgument("camera1", default_value="/sensing/camera/camera3/image_raw/compressed",
                               description="view 1: CAM_FRONT_LEFT (multi-view engines only)"),
         DeclareLaunchArgument("camera2", default_value="/sensing/camera/camera4/image_raw/compressed",
@@ -141,21 +90,22 @@ def generate_launch_description():
                               description="skip | zeros (the blank frame the camfront3 training used)"),
         DeclareLaunchArgument("max_rate_hz", default_value="10.0",
                               description="plans per second at most, paced on the view-0 stamps"),
+        DeclareLaunchArgument("motion_source", default_value="pose_difference",
+                              description="pose_difference (training convention) | twist"),
         DeclareLaunchArgument("rate", default_value="1.0", description="bag play rate"),
         DeclareLaunchArgument("start_offset", default_value="0.0",
                               description="start the bag this many seconds in"),
         DeclareLaunchArgument("play_delay", default_value="8.0",
                               description="seconds between node start and bag play (engine load)"),
-        DeclareLaunchArgument("viewer", default_value="rviz", description="rviz | rqt | none"),
-        DeclareLaunchArgument("show_route_points", default_value="false",
-                              description="true: draw the route points fed to the model (RViz layer and "
-                                          "BEV panel)"),
+        DeclareLaunchArgument("show_window", default_value="true",
+                              description="false: no OpenCV window (headless; use out_video)"),
+        DeclareLaunchArgument("out_video", default_value="",
+                              description="also write the camera overlay to this mp4"),
         OpaqueFunction(function=bag_nodes),
         # The node needs a few seconds to deserialize the engine and warm it
         # up; frames played before that are lost and the first plans would
         # wait for a full 1.5 s history anyway. /tf_static is played latched
-        # (qos_override.yaml) so the overlay finds the camera extrinsics, and
-        # so is a route recorded later in the bag (a reroute)
+        # (qos_override.yaml) so the overlay finds the camera extrinsics
         TimerAction(period=arg("play_delay"), actions=[
             ExecuteProcess(
                 cmd=["ros2", "bag", "play", arg("bag"), "--clock", "--rate", arg("rate"),
@@ -164,19 +114,8 @@ def generate_launch_description():
                      "--topics", *cameras,
                      "/sensing/camera/camera0/camera_info",
                      "/localization/kinematic_state", "/localization/acceleration",
-                     "/tf", "/tf_static", ROUTE, RECORDED_ROUTE_POINTS, RECORDED_PLAN],
+                     "/tf_static", ROUTE_POINTS],
                 output="screen",
             ),
         ]),
-        Node(
-            package="rviz2", executable="rviz2", name="rviz2",
-            arguments=["-d", os.path.join(share, "rviz", "replay.rviz")],
-            parameters=[{"use_sim_time": True}],
-            condition=LaunchConfigurationEquals("viewer", "rviz"),
-        ),
-        Node(
-            package="rqt_image_view", executable="rqt_image_view", name="viz_window",
-            arguments=["/latentdrive_node/viz"],
-            condition=LaunchConfigurationEquals("viewer", "rqt"),
-        ),
     ])

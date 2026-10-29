@@ -1,15 +1,8 @@
-# ros2 bag play --qos-profile-overrides-path: /tf_static and the route must be
-# played latched (transient local): a TF listener that starts after the first
-# message never sees the camera extrinsics otherwise, and the node's
-# transient-local route subscription does not match a volatile publisher.
-# Readable by both humble and jazzy, whichever QoS the bag's metadata.yaml
-# carries (or not)
+# ros2 bag play --qos-profile-overrides-path: /tf_static must be played
+# latched (transient local): a TF listener that starts after the first
+# message never sees the camera extrinsics otherwise. Readable by both humble
+# and jazzy, whichever QoS the bag's metadata.yaml carries (or not)
 /tf_static:
   history: keep_all
-  reliability: reliable
-  durability: transient_local
-/planning/mission_planning/route:
-  history: keep_last
-  depth: 1
   reliability: reliable
   durability: transient_local
