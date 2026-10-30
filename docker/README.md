@@ -120,5 +120,7 @@ the subgoal). `--out_video` under `/workspace` lands in the repo on the host.
 - **A `build/` from a different mount path** carries stale absolute paths in its
   CMake cache. If you previously built with the repo mounted elsewhere, wipe
   `build/` before the first `cmake -S core -B build` here.
+- **A `build/` from before the move of `CMakeLists.txt` to `core/`** points at
+  the old source directory, and CMake refuses it. Wipe `build/` once.
 - The ONNX itself is produced by the training repo (`deployment/export_onnx.py`);
   this container only consumes it. Everything from ONNX onward stays in C++.

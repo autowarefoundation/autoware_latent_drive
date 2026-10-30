@@ -260,6 +260,7 @@ draw on plain `cv::Mat`, so a node can publish the same canvas as
 ## Codebase layout
 
 ```
+core/           CMakeLists.txt of the library, apps and tests (out of the root, so colcon finds ros2/latentdrive_ros)
 include/
   common/       logger, timer, cuda RAII helpers, trajectory types
   latentdrive/  planner interface + params (the model contract), view window, status builder
