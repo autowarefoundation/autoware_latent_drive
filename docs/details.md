@@ -59,6 +59,10 @@ built for, pin it explicitly, e.g. `-DCUDA_DIR=/usr/local/cuda-12.8`. The
 framework has no ROS or Docker dependency, so this is also how it builds on the
 target vehicle.
 
+A `build/` from before the move of `CMakeLists.txt` to `core/` points at the old
+source directory, and CMake refuses it. Wipe `build/` once, also before
+`scripts/build.sh`.
+
 ## Commands
 
 One binary, `build/bin/latentdrive-trt`, three modes. Paths below use the
