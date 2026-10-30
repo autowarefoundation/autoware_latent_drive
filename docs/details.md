@@ -48,7 +48,7 @@ tarball) — the same versions the deployment container pins, so an engine built
 here loads on the vehicle; cuDNN is not needed. Then build:
 
 ```bash
-cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # or export TENSORRT_ROOT; omit if system-wide
+cmake -S core -B build -DTENSORRT_ROOT=/path/to/TensorRT   # or export TENSORRT_ROOT; omit if system-wide
 cmake --build build -j
 ```
 
