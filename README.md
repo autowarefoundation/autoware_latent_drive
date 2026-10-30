@@ -44,7 +44,7 @@ Everything runs in the public Autoware development image (ROS 2 humble, CUDA 12,
 git clone https://github.com/autowarefoundation/autoware_latent_drive.git
 cd autoware_latent_drive
 pip install -U huggingface_hub
-hf download AutowareFoundation/latent_drive --revision v1.0 --local-dir models/onnx/latent_drive \
+hf download AutowareFoundation/latent_drive --revision v1.0.0 --local-dir models/onnx/latent_drive \
   --exclude "media/*" --exclude replay.mp4
 
 # a shell in the container, this repository at /workspace and a rosbag at /bag
