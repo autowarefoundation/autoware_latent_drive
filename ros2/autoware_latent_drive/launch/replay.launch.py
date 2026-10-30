@@ -1,6 +1,6 @@
 """Open-loop replay: start the planner node, latch the bag's /tf_static, play the bag.
 
-    ros2 launch latentdrive_ros replay.launch.py \
+    ros2 launch autoware_latent_drive replay.launch.py \
         bag:=/path/to/bag_dir engine:=/path/to.engine [out_video:=/path/to.mp4]
 
 The engine decides how many cameras are read (the first 1, 2 or 3 of
@@ -34,7 +34,7 @@ def bag_nodes(context):
     value = lambda name: LaunchConfiguration(name).perform(context)  # noqa: E731
     cameras = [value(f"camera{i}") for i in range(3)]
     planner = Node(
-        package="latentdrive_ros",
+        package="autoware_latent_drive",
         executable="latentdrive_node",
         name="latentdrive_node",
         output="screen",
@@ -54,7 +54,7 @@ def bag_nodes(context):
     # /tf_static is recorded once, at the bag start, so a bag started at
     # start_offset never plays it; this publishes it, latched, from the bag
     tf_static = Node(
-        package="latentdrive_ros", executable="publish_tf_static.py", name="tf_static_from_bag",
+        package="autoware_latent_drive", executable="publish_tf_static.py", name="tf_static_from_bag",
         arguments=[value("bag"), "--start-offset", value("start_offset")],
         output="log",
     )
@@ -62,7 +62,7 @@ def bag_nodes(context):
 
 
 def generate_launch_description():
-    share = get_package_share_directory("latentdrive_ros")
+    share = get_package_share_directory("autoware_latent_drive")
     arg = LaunchConfiguration
     cameras = [arg("camera0"), arg("camera1"), arg("camera2")]
     qos_override = os.path.join(share, "config", "qos_override.yaml")

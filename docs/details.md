@@ -280,9 +280,9 @@ scripts/        build.sh (library, tests, ROS 2 package, engines), convert_map.p
 tests/          ctest unit tests (view window, status builder)
 samples/
   sample_data/  export_clip.py (rosbag -> clip), run_clip.cpp (latentdrive-sample-clip)
-  rosbag/       prepare_bag.sh, run_replay.sh (around ros2/latentdrive_ros)
+  rosbag/       prepare_bag.sh, run_replay.sh (around ros2/autoware_latent_drive)
 docker/         pilot-auto.xx1 deployment container (Dockerfile, build/run)
-ros2/           ROS 2 open-loop rosbag replay package (latentdrive_ros)
+ros2/           ROS 2 open-loop rosbag replay package (autoware_latent_drive)
 ```
 
 Every module is an interface class plus a `CreateX()` factory; the
@@ -296,7 +296,7 @@ pointers (RAII), errors go through the `logger` macros.
 - [x] BEV trajectory visualization
 - [x] Camera-frame waypoint overlay
 - [x] In-framework engine build from ONNX (TensorRT C++ builder API)
-- [x] ROS 2 node — open-loop rosbag replay ([`ros2/latentdrive_ros`](../ros2/latentdrive_ros))
+- [x] ROS 2 node — open-loop rosbag replay ([`ros2/autoware_latent_drive`](../ros2/autoware_latent_drive))
 - [x] Two-view planner (wide front + telephoto), history by timestamp
 - [x] Three-camera planner (camfront3), side views paired within 50 ms, optional blank fill
 - [x] Route-point status (six points), motion terms from differenced poses

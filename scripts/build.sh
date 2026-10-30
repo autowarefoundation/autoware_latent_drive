@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build everything needed to run the samples: the library and its apps
-# (build/), the unit tests, the latentdrive_ros package (ros2/install/) and
+# (build/), the unit tests, the autoware_latent_drive package (ros2/install/) and
 # one mixed-precision engine per ONNX export (models/engine/).
 #
 #   scripts/build.sh [onnx ...]
@@ -51,7 +51,7 @@ if [ "${SKIP_TESTS:-0}" != 1 ]; then
 fi
 
 if [ "${SKIP_ROS:-0}" != 1 ]; then
-  step "latentdrive_ros -> $REPO/ros2/install"
+  step "autoware_latent_drive -> $REPO/ros2/install"
   # ROS_DISTRO alone is no sign of a sourced ROS: the Autoware images set it
   if [ -z "${AMENT_PREFIX_PATH:-}" ]; then
     setup=/opt/ros/${ROS_DISTRO:-}/setup.bash

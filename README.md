@@ -106,7 +106,7 @@ every checkpoint.
 - [`docs/details.md`](docs/details.md): native build, the `latentdrive-trt` binary, the input contract in
   detail, the status builder, the library API and the code layout
 - [`samples/rosbag`](samples/rosbag), [`samples/sample_data`](samples/sample_data),
-  [`ros2/latentdrive_ros`](ros2/latentdrive_ros): the samples and the ROS 2 node
+  [`ros2/autoware_latent_drive`](ros2/autoware_latent_drive): the samples and the ROS 2 node
 - [Hugging Face model card](https://huggingface.co/AutowareFoundation/latent_drive): training, limitations
 
 This is a research model: it is not a certified driving system and must not control a vehicle on public roads.

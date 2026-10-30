@@ -1,6 +1,6 @@
 # Sample 2: rosbag (ROS 2 node, live replay)
 
-Play a vehicle rosbag and let the `latentdrive_ros` node plan on it as it
+Play a vehicle rosbag and let the `autoware_latent_drive` node plan on it as it
 plays, the way the vehicle node does: the cameras, odometry, acceleration and
 the route points come in as topics, one plan per CAM_FRONT frame goes out,
 drawn on the front camera image in a window and, if asked, an mp4.
@@ -28,11 +28,12 @@ samples/rosbag/run_replay.sh /data/bags/1551 models/engine/camfront3-rptw-lane2-
     start_offset:=60 out_video:=/data/bags/1551/replay.mp4
 ```
 
-`run_replay.sh <bag> <engine> [arg:=value ...]` is `ros2 launch latentdrive_ros
-replay.launch.py` with the paths filled in (`INSTALL=` points at another
-colcon install space). It starts the node, waits 8 s for the engine to load
-and plays the bag with `--clock`. A window shows the plan on the front camera
-(Esc or q closes it; Ctrl-C in the terminal stops everything).
+`run_replay.sh <bag> <engine> [arg:=value ...]` is
+`ros2 launch autoware_latent_drive replay.launch.py` with the paths filled in
+(`INSTALL=` points at another colcon install space). It starts the node, waits
+8 s for the engine to load and plays the bag with `--clock`. A window shows the
+plan on the front camera (Esc or q closes it; Ctrl-C in the terminal stops
+everything).
 
 | launch arg | default | |
 |---|---|---|
