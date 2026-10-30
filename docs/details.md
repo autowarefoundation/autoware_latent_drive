@@ -59,9 +59,9 @@ built for, pin it explicitly, e.g. `-DCUDA_DIR=/usr/local/cuda-12.8`. The
 framework has no ROS or Docker dependency, so this is also how it builds on the
 target vehicle.
 
-A `build/` from before the move of `CMakeLists.txt` to `core/` points at the old
-source directory, and CMake refuses it. Wipe `build/` once, also before
-`scripts/build.sh`.
+A `build/` (or the `BUILD_DIR` of `scripts/build.sh`) configured before
+`CMakeLists.txt` moved to `core/` points at the old source directory, and CMake
+refuses it. Delete it once.
 
 ## Commands
 
@@ -264,7 +264,7 @@ draw on plain `cv::Mat`, so a node can publish the same canvas as
 ## Codebase layout
 
 ```
-core/           CMakeLists.txt of the library, apps and tests (out of the root, so colcon finds ros2/latentdrive_ros)
+core/           CMakeLists.txt of the library, apps and tests (kept out of the root for colcon)
 include/
   common/       logger, timer, cuda RAII helpers, trajectory types
   latentdrive/  planner interface + params (the model contract), view window, status builder

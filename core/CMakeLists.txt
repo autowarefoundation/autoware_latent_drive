@@ -11,7 +11,7 @@ endif()
 # ==============================================================================
 # This file sits in core/ and not in the repo root: a CMakeLists.txt in the root
 # makes colcon take the whole repo as one package and miss ros2/latentdrive_ros.
-# core/COLCON_IGNORE keeps colcon from picking up this project instead
+# core/COLCON_IGNORE hides this project from colcon, so only ros2/latentdrive_ros is found
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(SRC_PATH "${REPO_ROOT}/src")
 set(INC_PATH "${REPO_ROOT}/include")
