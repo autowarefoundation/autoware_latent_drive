@@ -48,7 +48,7 @@ tarball) — the same versions the deployment container pins, so an engine built
 here loads on the vehicle; cuDNN is not needed. Then build:
 
 ```bash
-cmake -B build -DTENSORRT_ROOT=/path/to/TensorRT   # or export TENSORRT_ROOT; omit if system-wide
+cmake -S core -B build -DTENSORRT_ROOT=/path/to/TensorRT   # or export TENSORRT_ROOT; omit if system-wide
 cmake --build build -j
 ```
 
@@ -58,6 +58,10 @@ headers and libs are picked up from `$TENSORRT_ROOT/{include,lib}`). If the
 built for, pin it explicitly, e.g. `-DCUDA_DIR=/usr/local/cuda-12.8`. The
 framework has no ROS or Docker dependency, so this is also how it builds on the
 target vehicle.
+
+A `build/` (or the `BUILD_DIR` of `scripts/build.sh`) configured before
+`CMakeLists.txt` moved to `core/` points at the old source directory, and CMake
+refuses it. Delete it once.
 
 ## Commands
 
@@ -260,6 +264,7 @@ draw on plain `cv::Mat`, so a node can publish the same canvas as
 ## Codebase layout
 
 ```
+core/           CMakeLists.txt of the library, apps and tests (kept out of the root for colcon)
 include/
   common/       logger, timer, cuda RAII helpers, trajectory types
   latentdrive/  planner interface + params (the model contract), view window, status builder

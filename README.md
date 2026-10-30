@@ -59,6 +59,8 @@ scripts/build.sh                                                        # three 
 scripts/build.sh models/onnx/latent_drive/camfront-rptw-lane2-e1.onnx   # one camera, ~1.5 min
 ```
 
+A `build/` configured before `CMakeLists.txt` moved to `core/` makes CMake stop with "does not match the source". Delete it once.
+
 ## Run
 
 Both samples need a rosbag recorded on a LatentDrive run: the cameras (`camera0`, `camera3`, `camera4`),

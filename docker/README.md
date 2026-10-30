@@ -49,7 +49,7 @@ shell this opens; `NAME=ltrt` keeps the container alive between calls.
 ## 3. Compile the framework
 
 ```bash
-cmake -B build && cmake --build build -j
+cmake -S core -B build && cmake --build build -j
 ```
 
 Produces `build/bin/latentdrive-trt`. One binary, three `--mode`s. The unit
@@ -119,6 +119,8 @@ the subgoal). `--out_video` under `/workspace` lands in the repo on the host.
   the way, or `rm -rf build` from inside the container before reconfiguring.
 - **A `build/` from a different mount path** carries stale absolute paths in its
   CMake cache. If you previously built with the repo mounted elsewhere, wipe
-  `build/` before the first `cmake -B build` here.
+  `build/` before the first `cmake -S core -B build` here.
+- **A `build/` from before the move of `CMakeLists.txt` to `core/`** points at
+  the old source directory, and CMake refuses it. Wipe `build/` once.
 - The ONNX itself is produced by the training repo (`deployment/export_onnx.py`);
   this container only consumes it. Everything from ONNX onward stays in C++.

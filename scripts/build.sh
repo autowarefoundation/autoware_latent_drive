@@ -42,7 +42,7 @@ for onnx in "${ONNX[@]}"; do
 done
 
 step "library and apps -> $BUILD_DIR"
-cmake -S "$REPO" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+cmake -S "$REPO/core" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_DIR" -j "$JOBS"
 
 if [ "${SKIP_TESTS:-0}" != 1 ]; then

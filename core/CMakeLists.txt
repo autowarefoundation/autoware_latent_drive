@@ -9,8 +9,12 @@ endif()
 # ==============================================================================
 # Paths
 # ==============================================================================
-set(SRC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src")
-set(INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# This file sits in core/ and not in the repo root: a CMakeLists.txt in the root
+# makes colcon take the whole repo as one package and miss ros2/latentdrive_ros.
+# core/COLCON_IGNORE hides this project from colcon, so only ros2/latentdrive_ros is found
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set(SRC_PATH "${REPO_ROOT}/src")
+set(INC_PATH "${REPO_ROOT}/include")
 
 # CUDA install to link against; override with -DCUDA_DIR=/usr/local/cuda-12.8
 # when the default symlink points at a different toolkit than the engine needs
@@ -140,9 +144,9 @@ set_target_properties(
 # samples/sample_data: the offline pipeline on a clip cut from a rosbag
 # (export_clip.py), with the library API alone. The rosbag sample is the ROS 2
 # package under ros2/ and builds with colcon
-set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/samples/sample_data/run_clip.cpp
+set_source_files_properties(${REPO_ROOT}/samples/sample_data/run_clip.cpp
                             PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
-add_executable(latentdrive-sample-clip ${CMAKE_CURRENT_SOURCE_DIR}/samples/sample_data/run_clip.cpp)
+add_executable(latentdrive-sample-clip ${REPO_ROOT}/samples/sample_data/run_clip.cpp)
 target_link_libraries(latentdrive-sample-clip PRIVATE latentdrive)
 set_target_properties(latentdrive-sample-clip PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -156,7 +160,7 @@ set_target_properties(latentdrive-sample-clip PROPERTIES RUNTIME_OUTPUT_DIRECTOR
 option(BUILD_TESTING "Build the unit tests" ON)
 if(BUILD_TESTING)
   enable_testing()
-  file(GLOB TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+  file(GLOB TEST_SRC "${REPO_ROOT}/tests/*.cpp")
   # One executable and one ctest entry per test file
   foreach(CXX_FILE ${TEST_SRC})
     set_source_files_properties(${CXX_FILE} PROPERTIES COMPILE_FLAGS "${CXX_FLAGS}")
