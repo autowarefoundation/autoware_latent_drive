@@ -1,4 +1,4 @@
-# latentdrive_ros
+# autoware_latent_drive
 
 Minimal ROS 2 node (humble or jazzy) for **open-loop rosbag replay** of the
 LatentDrive planner: play a bag, run the engine live on the cameras + ego
@@ -65,7 +65,7 @@ the drawn image is `viz_width` x `viz_width / 2`).
 source /opt/ros/<distro>/setup.bash
 cd ros2 && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
-ros2 launch latentdrive_ros replay.launch.py bag:=/path/to/bag engine:=/path/to.engine
+ros2 launch autoware_latent_drive replay.launch.py bag:=/path/to/bag engine:=/path/to.engine
 ```
 
 `TENSORRT_ROOT` (env or `-DTENSORRT_ROOT`) points at a TensorRT tarball when
